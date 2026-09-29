@@ -181,6 +181,7 @@
 - `setup:admin` 이 비밀번호 길이 오류 → 비밀번호는 **6자 이상이어야** 한다(Supabase Auth 기본 정책).
 - `seed:demo` 실패 → `setup:admin` 을 먼저 했는지, `.env.local` 의 `SUPABASE_SERVICE_ROLE_KEY` 가 채워졌는지 확인.
 - 로그인 안 됨 → 1) 이메일이 아니라 **ID(`admin`)** 로 시도했는지 확인, 2) `npm run setup:admin -- admin <새비밀번호>` 로 재설정.
+- 로그인 안 했는데 화면이 열리고 자료가 비어 있음 → Supabase 연결 실패. `SETUP.md` 「자주 막히는 곳」의 같은 항목대로 안내한다.
 - **`gh auth login`/`vercel login` 이 브라우저를 안 열고 코드/토큰을 요구** → 비대화형(`!`)에서 돌려서다.
   supabase 와 동일하게 **사용자가 새 터미널에서 직접** 실행하게 한다. (`gh` 는 device code 가 떠도 브라우저에서
   코드 입력으로 진행 가능하니, 뜨면 그 코드를 안내한다.)

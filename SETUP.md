@@ -412,8 +412,8 @@ vercel --prod
   2) `npm run setup:admin` 을 다시 실행해 기본 계정을 재생성(비밀번호 재설정)한 뒤 다시 시도.
 - **로그인하지 않았는데 화면이 열리고 자료는 비어 있음** → 앱이 Supabase 에 연결하지 못한 상태입니다.
   네트워크 장애로 쓰던 사람이 로그아웃되지 않도록, 연결이 안 될 때는 화면을 막지 않고 열어 두게 만들었습니다.
-  자료는 DB 규칙(RLS)이 막으므로 보이지 않습니다. `.env.local` 의 Supabase URL 이 맞는지,
-  Supabase 대시보드에서 프로젝트가 일시정지(Paused)되지 않았는지 확인한 뒤 `npm run dev` 를 다시 켜세요.
+  서버와 연결이 안 되니 자료를 불러오지 못해 비어 보이는 것입니다. `.env.local` 의 Supabase URL 이 맞는지 확인하고,
+  Supabase 대시보드에서 프로젝트가 일시정지(Paused)됐다면 **Restore** 를 눌러 몇 분 기다린 뒤 `npm run dev` 를 다시 켜세요.
 - **비밀번호가 너무 짧다는 오류** → 비밀번호는 **6자 이상**이어야 합니다.
 - **`npm run build`/실행 실패** → `.env.local` 에 Supabase 값(URL/anon/service_role)이 채워졌는지 확인.
 - **`npm run seed:demo` 가 실패** → 4단계의 `setup:admin` 을 먼저 실행했는지, `.env.local` 의 `SUPABASE_SERVICE_ROLE_KEY` 가 채워졌는지 확인.
