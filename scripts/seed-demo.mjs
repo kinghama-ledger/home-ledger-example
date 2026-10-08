@@ -72,7 +72,6 @@ const TODAY_ARG = args.find((a) => a.startsWith("--today="))?.slice("--today=".l
 
 const DEMO_TAG = "DEMO"; // hh_transaction.note 에 넣는 마커
 const DEFAULT_LOGIN_ID = "admin";
-const DEFAULT_PASSWORD_HINT = "jadong!"; // create-admin.mjs 의 기본값(안내 문구용)
 
 // ── .env.local 로드 (create-admin.mjs 와 같은 방식) ───────────────────────────
 function loadEnvFile(path) {
@@ -651,7 +650,7 @@ async function main() {
     console.log("========================================");
     console.log(`  데모 데이터 ${DRY_RUN ? "계획 확인 완료 (DB 변경 없음)" : "준비 완료!"}`);
     console.log(`  로그인 ID : ${loginId}`);
-    console.log(`  비밀번호  : ${DEFAULT_PASSWORD_HINT}  (setup:admin 기본값 — 바꿨다면 바꾼 값)`);
+    console.log("  비밀번호  : setup:admin 때 화면에 나온 값 (잊었으면 npm run setup:admin 다시 실행)");
     console.log("========================================");
     console.log("npm run dev 후 http://localhost:3000 에서 로그인하세요.");
     console.log("지우려면: node scripts/seed-demo.mjs --reset\n");

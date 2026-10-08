@@ -2,19 +2,33 @@
 // Supabase Auth 사용자 + employees 테이블 행을 한 번에 생성합니다.
 //
 // 사용법:
-//   npm run setup:admin                  # 기본값: 로그인ID=admin, 비밀번호=jadong!(고정)
+//   npm run setup:admin                  # 로그인ID=admin, 비밀번호는 실행할 때마다 무작위로 새로 만든다
 //   npm run setup:admin -- myid mypw      # 로그인ID/비밀번호 직접 지정
 //
-// 실행 후 출력되는 [로그인 ID]와 [비밀번호]로 로그인하세요.
+// 비밀번호 정하는 순서: 명령 인자 → .env.local 의 ADMIN_PASSWORD → (둘 다 없으면) 무작위 12자.
+// 로그인 비밀번호가 설정된 "직후"(직원 레코드 작업 전)에 [로그인 ID]와 [비밀번호]를 크게 보여 준다.
+// 화면에 비밀번호를 찍는 것은 이번 실행에서 새로 만든 무작위 비밀번호뿐이다. 지정한 값은 다시 찍지 않는다.
+// 이 스크립트는 비밀번호를 어디에도 저장하지 않고 다시 알려 주지도 않으니 그때 적어 둔다.
+//
+// ⚠️ 재실행 동작: 이미 같은 계정이 있으면 비밀번호를 "새 값으로 재설정"한다(아래 updateUserById).
+//    비밀번호를 지정하지 않고 다시 실행하면 → 새 무작위 비밀번호로 바뀌고 화면에 나온다.
+//    그래서 비밀번호를 잊었을 때는 `npm run setup:admin` 을 다시 실행하면 된다(복구 방법).
+//    다른 ID 로 만들었다면 `npm run setup:admin -- 그ID` (또는 .env.local 에 ADMIN_LOGIN_ID 를 적어 둔다).
+//    .env.local 에 ADMIN_PASSWORD 를 적어 두었다면 그 값으로 재설정된다.
 
 import { readFileSync } from "node:fs";
+import { randomInt } from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
 
-// 예제용 기본 관리자 계정 (외우기 쉽게 고정). 로그인 후 마이페이지에서 꼭 변경하세요.
 const DEFAULT_LOGIN_ID = "admin";
-const DEFAULT_PASSWORD = "jadong!"; // 6자 이상(Supabase Auth 최소 정책) 충족
-// ⚠️ 이미 쓰던 계정에 재실행하면 비밀번호를 이 값으로 "덮어쓴다"(아래 updateUserById).
-//    비밀번호를 바꿔 쓰는 중이면 .env.local 의 ADMIN_PASSWORD 가 우선 적용되므로 원복되지 않는다.
+
+// 헷갈리는 글자(0 O 1 l I)를 뺀 영문·숫자. 12자 = Supabase Auth 최소 6자 충족.
+const PASSWORD_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+function generatePassword(length = 12) {
+  let out = "";
+  for (let i = 0; i < length; i++) out += PASSWORD_CHARS[randomInt(PASSWORD_CHARS.length)];
+  return out;
+}
 
 // .env.local 을 직접 읽어 환경변수로 로드 (Node 버전 무관)
 function loadEnvFile(path) {
@@ -58,8 +72,34 @@ if (!url || !serviceKey) {
 
 const loginId = (process.argv[2] || process.env.ADMIN_LOGIN_ID || DEFAULT_LOGIN_ID).trim();
 const name = (process.env.ADMIN_NAME || "관리자").trim();
-const password = process.argv[3] || process.env.ADMIN_PASSWORD || DEFAULT_PASSWORD;
+const givenPassword = process.argv[3] || process.env.ADMIN_PASSWORD || "";
+const generated = !givenPassword; // 지정한 비밀번호가 없으면 무작위로 만든다
+const password = givenPassword || generatePassword();
 const email = loginId.includes("@") ? loginId : `${loginId}@${domain}`;
+// 잊었을 때 다시 칠 명령. ID 를 명령 인자로 바꿔 만들었으면 그 ID 를 붙여 안내한다.
+const recoverCmd =
+  process.argv[2] && loginId !== (process.env.ADMIN_LOGIN_ID || DEFAULT_LOGIN_ID).trim()
+    ? `npm run setup:admin -- ${loginId}`
+    : "npm run setup:admin";
+let passwordApplied = false; // Auth 비밀번호가 실제로 설정됐는지(오류 안내용)
+
+// 로그인 비밀번호가 설정된 직후 한 번만 크게 보여 준다.
+function printCredentials() {
+  const bar = "==================================================";
+  console.log("\n" + bar);
+  console.log("  🔑 로그인 정보");
+  console.log("");
+  console.log("  👤 로그인 ID : " + loginId);
+  if (generated) {
+    console.log("  🔒 비밀번호  : " + password);
+    console.log("");
+    console.log("  ✍️  지금 적어 두세요 — 이 스크립트는 비밀번호를 저장하거나 다시 알려 주지 않습니다.");
+    console.log("  잊었으면 `" + recoverCmd + "` 을 다시 실행하세요. (새 비밀번호로 바뀌고 다시 나옵니다.)");
+  } else {
+    console.log("  🔒 비밀번호  : 지정한 비밀번호로 설정됨 (화면에 다시 찍지 않습니다)");
+  }
+  console.log(bar + "\n");
+}
 
 const supabase = createClient(url, serviceKey, {
   auth: { autoRefreshToken: false, persistSession: false },
@@ -97,11 +137,19 @@ async function main() {
       email_confirm: true,
     });
     if (upd.error) throw new Error(upd.error.message);
-    console.log("기존 Auth 사용자의 비밀번호를 갱신했습니다.");
+    passwordApplied = true;
+    console.log(
+      generated
+        ? "이미 있는 계정입니다. 비밀번호를 새 무작위 값으로 재설정했습니다."
+        : "이미 있는 계정입니다. 비밀번호를 지정한 값으로 재설정했습니다."
+    );
   } else {
     authUserId = created.data.user.id;
+    passwordApplied = true;
     console.log("Auth 사용자를 생성했습니다.");
   }
+  // 비밀번호는 이미 바뀌었으므로 아래 직원 레코드 작업이 실패해도 볼 수 있게 지금 보여 준다.
+  printCredentials();
 
   // 2) employees 행 생성/갱신 (관리자 권한)
   const { data: existingEmp, error: selErr } = await supabase
@@ -131,17 +179,20 @@ async function main() {
     console.log("관리자 직원 레코드를 생성했습니다.");
   }
 
-  console.log("\n========================================");
-  console.log("  🔑 관리자 계정 준비 완료!");
-  console.log("  👤 로그인 ID : " + loginId);
-  console.log("  🔒 비밀번호  : " + password);
-  console.log("========================================");
-  console.log("\n이제 `npm run dev` 후 위 정보로 로그인하세요.");
-  console.log("👉 로그인 후 왼쪽 사이드바 맨 아래 '내 이름'을 눌러 마이페이지에서 비밀번호를 꼭 변경하세요.\n");
+  console.log("\n✅ 관리자 계정 준비 완료! `npm run dev` 후 위 ID·비밀번호로 로그인하세요.");
+  console.log("(비밀번호는 원하면 로그인 후 마이페이지에서 바꿀 수 있습니다.)\n");
 }
 
 main().catch((err) => {
   console.error("\n[오류] 관리자 생성 실패:", err.message);
+  if (passwordApplied) {
+    console.error(
+      generated
+        ? "⚠️ 로그인 비밀번호는 이미 바뀌었습니다(위에 나온 값). 원인을 고친 뒤 `" + recoverCmd +
+            "` 을 다시 실행하면 새 비밀번호가 나옵니다."
+        : "⚠️ 로그인 비밀번호는 이미 지정한 값으로 바뀌었습니다. 원인을 고친 뒤 같은 명령을 다시 실행하세요."
+    );
+  }
   console.error("Supabase 마이그레이션(supabase db push)이 먼저 적용되었는지 확인하세요.\n");
   process.exit(1);
 });
