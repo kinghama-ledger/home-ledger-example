@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { CalendarClock, ChevronDown, Pencil, PiggyBank, Plus, Sparkles, Terminal, Trash2, Users, Wallet, Tags, Smartphone, KeyRound, Copy } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { MACRODROID_SMS_BODY, macroDroidCurl } from "@/lib/household/macrodroid-curl";
 import { toast } from "sonner";
 
 import {
@@ -65,9 +66,14 @@ async function sha256Hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
 }
-async function copyText(value: string) {
-  await navigator.clipboard.writeText(value);
-  toast.success("복사했습니다.");
+async function copyText(value: string, done = "복사했습니다.") {
+  // 복사는 실패할 수 있다(메신저 안 브라우저·권한 거부·http 주소). 말없이 넘어가면 옛 복사본을 붙여 넣게 된다.
+  try {
+    await navigator.clipboard.writeText(value);
+    toast.success(done);
+  } catch {
+    toast.error("복사에 실패했습니다. 크롬 같은 일반 브라우저에서 다시 열어 주세요.");
+  }
 }
 
 export default function HouseholdSettingsPage() {
@@ -81,6 +87,12 @@ export default function HouseholdSettingsPage() {
   const [balances, setBalances] = useState<Record<string, number>>({});
   const [tokens, setTokens] = useState<IngestToken[]>([]);
   const [issuedToken, setIssuedToken] = useState<string | null>(null);
+  // 보고 있는 탭. 자료를 다시 읽는 동안(loading) 화면이 통째로 다시 그려지므로 Tabs 안에 두면 첫 탭으로 돌아간다
+  // (토큰을 발급하면 방금 받은 토큰이 안 보이던 문제).
+  // 고르기 전(null)에는 주소를 따른다: 수집함의 '문자 자동수집 설정' 단추는 ?tab=ingest 로 온다.
+  // 주소는 Tabs 를 그릴 때 읽는다 — 화면 전환 직후에는 주소가 아직 안 바뀌어 있어, 상태의 첫 값으로 읽으면 놓친다.
+  // (Tabs 는 loading 이 끝난 뒤, 곧 브라우저에서만 그려진다. 그 앞의 이른 반환을 없애면 서버에서 window 를 읽게 되니 같이 고친다.)
+  const [tab, setTab] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
@@ -578,7 +590,7 @@ export default function HouseholdSettingsPage() {
   );
   const ingestUrl = typeof window !== "undefined" ? `${window.location.origin}/api/household/inbox/sms` : "/api/household/inbox/sms";
   const tokenHeader = `X-Ingest-Token: ${issuedToken ?? "발급받은_토큰"}`;
-  const macroDroidBody = "[sms_message]";
+  const macroDroidBody = MACRODROID_SMS_BODY;
   const jsonBody = `{"text":"[sms_message]","sender":"[sms_sender]"}`;
 
   return (
@@ -603,7 +615,7 @@ export default function HouseholdSettingsPage() {
         }
       />
 
-      <Tabs defaultValue="accounts">
+      <Tabs value={tab ?? (new URLSearchParams(window.location.search).get("tab") === "ingest" ? "ingest" : "accounts")} onValueChange={setTab}>
         {/* overflow-x-auto 단독이면 overflow-y가 auto로 승격돼 1px 초과에도 세로 스크롤바(▲▼)가 생긴다 → overflow-y-hidden 병기. */}
         <div className="-mx-4 overflow-x-auto overflow-y-hidden px-4 md:mx-0 md:px-0">
           <TabsList className="min-w-max">
@@ -818,6 +830,15 @@ export default function HouseholdSettingsPage() {
                 </Button>
                 <Button size="sm" variant="ghost" onClick={() => setIssuedToken(null)}>닫기</Button>
               </div>
+              {/* 폰에서 이 화면을 열어 누르면, 토큰을 옮겨 적지 않고 MacroDroid 에 한 번에 넣을 수 있다. */}
+              <div className="mt-3 border-t border-amber-400/40 pt-3">
+                <Button size="sm" onClick={() => void copyText(macroDroidCurl(ingestUrl, issuedToken), "MacroDroid 용으로 복사했습니다.")}>
+                  <Copy className="h-4 w-4" /> MacroDroid 용 한 번에 복사
+                </Button>
+                <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">
+                  폰에서 누른 뒤, MacroDroid 의 HTTP 요청 화면 맨 위 제목 오른쪽 첫 번째 단추(네모 안으로 화살표)를 눌러 뜨는 &apos;cURL 명령어 가져오기&apos; 창에 붙여 넣으면 주소·토큰이 한 번에 들어갑니다.
+                </p>
+              </div>
             </div>
           )}
 
@@ -858,6 +879,9 @@ export default function HouseholdSettingsPage() {
             </summary>
             <div className="space-y-4 border-t border-border/60 p-4">
               <div className="text-sm text-muted-foreground">
+                <p className="mb-2">
+                  MacroDroid 는 위의 <b>토큰 발급</b> 뒤 노란 상자에 나오는 <b>MacroDroid 용 한 번에 복사</b>가 가장 쉽습니다. 아래는 칸마다 직접 넣을 때의 값입니다.
+                </p>
                 <p>
                   폰의 <b>문자전달 앱</b>(예: SMS Forwarder)이 결제/입금 문자를 아래 주소로 보내면 수집함에 자동으로 쌓입니다.
                   점검 후 확정하면 거래로 등록됩니다.

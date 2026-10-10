@@ -1172,7 +1172,7 @@ export default function HouseholdInboxPage() {
             <div className="mt-4 flex flex-wrap justify-center gap-2">
               <Button onClick={() => setDialogOpen(true)}><Plus className="h-4 w-4" />수동 추가</Button>
               <Button variant="outline" onClick={() => setUploadOpen(true)}><FileUp className="h-4 w-4" />명세서 업로드</Button>
-              <Button variant="outline" asChild><Link href="/dashboard/household/settings"><Settings className="h-4 w-4" />문자 자동수집 설정</Link></Button>
+              <Button variant="outline" asChild><Link href="/dashboard/household/settings?tab=ingest"><Settings className="h-4 w-4" />문자 자동수집 설정</Link></Button>
             </div>
           </div>
         );
