@@ -66,10 +66,11 @@ async function sha256Hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
 }
-async function copyText(value: string, done = "복사했습니다.") {
+async function copyText(value: string | (() => string), done = "복사했습니다.") {
   // 복사는 실패할 수 있다(메신저 안 브라우저·권한 거부·http 주소). 말없이 넘어가면 옛 복사본을 붙여 넣게 된다.
+  // 값을 만드는 일(함수로 받은 경우)이 실패해도 같은 알림으로 알린다.
   try {
-    await navigator.clipboard.writeText(value);
+    await navigator.clipboard.writeText(typeof value === "function" ? value() : value);
     toast.success(done);
   } catch {
     toast.error("복사에 실패했습니다. 크롬 같은 일반 브라우저에서 다시 열어 주세요.");
@@ -832,7 +833,7 @@ export default function HouseholdSettingsPage() {
               </div>
               {/* 폰에서 이 화면을 열어 누르면, 토큰을 옮겨 적지 않고 MacroDroid 에 한 번에 넣을 수 있다. */}
               <div className="mt-3 border-t border-amber-400/40 pt-3">
-                <Button size="sm" onClick={() => void copyText(macroDroidCurl(ingestUrl, issuedToken), "MacroDroid 용으로 복사했습니다.")}>
+                <Button size="sm" onClick={() => void copyText(() => macroDroidCurl(ingestUrl, issuedToken), "MacroDroid 용으로 복사했습니다.")}>
                   <Copy className="h-4 w-4" /> MacroDroid 용 한 번에 복사
                 </Button>
                 <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">
@@ -896,6 +897,7 @@ export default function HouseholdSettingsPage() {
               <div className="grid gap-3 md:grid-cols-2">
                 <MacroSettingCard
                   title="MacroDroid"
+                  tokenReady={issuedToken !== null}
                   rows={[
                     { label: "URL", value: ingestUrl },
                     { label: "Method", value: "POST" },
@@ -906,6 +908,7 @@ export default function HouseholdSettingsPage() {
                 />
                 <MacroSettingCard
                   title="JSON 전송 앱"
+                  tokenReady={issuedToken !== null}
                   rows={[
                     { label: "URL", value: ingestUrl },
                     { label: "Header", value: tokenHeader },
@@ -1051,7 +1054,13 @@ function EmptyHint({ text }: { text: string }) {
   );
 }
 
-function MacroSettingCard({ title, rows }: { title: string; rows: Array<{ label: string; value: string }> }) {
+function MacroSettingCard({ title, rows, tokenReady }: {
+  title: string;
+  rows: Array<{ label: string; value: string }>;
+  /** 방금 발급한 토큰이 화면에 있는가. 없으면 Header 줄은 자리표시 글자라, 복사해 넣으면 말없이 실패한다. */
+  tokenReady: boolean;
+}) {
+  const needToken = "토큰 발급 직후에만 복사할 수 있습니다";
   return (
     <div className="rounded-2xl border border-border/70 bg-background/40 p-4">
       <div className="mb-3 flex items-center justify-between gap-2">
@@ -1059,6 +1068,8 @@ function MacroSettingCard({ title, rows }: { title: string; rows: Array<{ label:
         <Button
           size="sm"
           variant="outline"
+          disabled={!tokenReady}
+          title={tokenReady ? undefined : needToken}
           onClick={() => void copyText(rows.map((r) => `${r.label}: ${r.value}`).join("\n"))}
         >
           <Copy className="h-4 w-4" />
@@ -1070,7 +1081,13 @@ function MacroSettingCard({ title, rows }: { title: string; rows: Array<{ label:
           <div key={row.label} className="grid gap-1 py-2 md:grid-cols-[96px_1fr_auto] md:items-center">
             <span className="text-xs font-medium text-muted-foreground">{row.label}</span>
             <code className="break-all rounded bg-muted px-2 py-1 font-mono text-xs text-foreground">{row.value}</code>
-            <Button size="icon" variant="ghost" title={`${row.label} 복사`} onClick={() => void copyText(row.value)}>
+            <Button
+              size="icon"
+              variant="ghost"
+              disabled={row.label === "Header" && !tokenReady}
+              title={row.label === "Header" && !tokenReady ? needToken : `${row.label} 복사`}
+              onClick={() => void copyText(row.value)}
+            >
               <Copy className="h-4 w-4" />
             </Button>
           </div>

@@ -58,6 +58,7 @@
     "test:month-flow": "tsx scripts/test_month_flow.mts",
     "test:short-won": "tsx scripts/test_short_won.mts",
     "test:macrodroid-curl": "tsx scripts/test_macrodroid_curl.mts",
+    "test:ingest-tab": "node scripts/test_ingest_tab.mjs",
     "test:category-names": "tsx scripts/test_category_names.mts",
     "test:income-split": "tsx scripts/test_income_split.mts",
     "test:loan-reuse": "tsx scripts/test_loan_reuse.mts",
