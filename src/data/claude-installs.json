@@ -1,0 +1,36 @@
+{
+  "scannedAt": "2026-01-05",
+  "count": 3,
+  "items": [
+    {
+      "id": "node",
+      "name": "Node.js",
+      "category": "런타임",
+      "version": "24.0.0",
+      "date": "2026-01-05",
+      "source": "예시 기기 '해봄 노트북' · winget (OpenJS.NodeJS.LTS)",
+      "note": "예시 — JavaScript 런타임. 앱을 빌드하고 실행하는 데 필요합니다.",
+      "install": "winget install --id OpenJS.NodeJS.LTS -e"
+    },
+    {
+      "id": "git",
+      "name": "Git",
+      "category": "버전관리",
+      "version": "2.50.0",
+      "date": "2026-01-05",
+      "source": "예시 기기 '해봄 노트북' · winget (Git.Git)",
+      "note": "예시 — 소스 관리. 코드를 받고 고친 내용을 기록합니다.",
+      "install": "winget install --id Git.Git -e"
+    },
+    {
+      "id": "supabase",
+      "name": "Supabase CLI",
+      "category": "배포·DB",
+      "version": "2.0.0",
+      "date": "2026-01-06",
+      "source": "예시 기기 '해봄 노트북' · 프로젝트 개발 의존성",
+      "note": "예시 — 가계부 DB(Supabase)를 만들고 고칠 때 씁니다. 명령은 npx supabase 로 실행합니다.",
+      "install": "npm install supabase --save-dev"
+    }
+  ]
+}

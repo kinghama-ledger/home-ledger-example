@@ -1,0 +1,94 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# ───── 여기부터 가계부 추가분 (위는 create-next-app 기준본 그대로) ─────
+
+# 환경변수: 실제 값이 든 파일은 위에서 전부 막혔다. 변수 이름만 적은 예시 파일 하나만 다시 연다
+!/.env.example
+
+# JSON 은 일단 전부 막는다. 클라우드 서비스 계정 키는 JSON 이고 이름이 제각각이라
+# (프로젝트이름-숫자-글자.json 등) 이름 무늬로는 다 걸러 낼 수 없다.
+*.json
+# 그다음 이 저장소가 실제로 쓰는 JSON 만 자리를 정해 다시 연다.
+#   맨 위 폴더의 설정 파일 5개
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/components.json
+!/vercel.json
+#   앱이 읽는 자료 폴더 (키를 내려받아 둘 자리가 아니다)
+!/src/data/*.json
+# JSON 을 새로 올려야 하면 위에 한 줄을 더한다. `git add -f` 로 넘기지 않는다.
+
+# JSON 이 아닌 키·인증서 파일
+*.key
+*.p12
+*.pfx
+
+# 관리자 계정 스크립트가 적어 두는 로그인 ID(비밀은 아니지만 이 PC 에서만 쓰는 값)
+/.admin-login-id
+
+# Supabase CLI 가 이 PC 에 남기는 연결 정보·캐시
+/supabase/.temp/
+/supabase/.branches/
+
+# 개발 서버·배포 로그
+.devserver.log
+.vercel-deploy*.log
+
+# 파이썬 스크립트 실행 부산물
+__pycache__/
+*.pyc
+
+# 산출물·백업·엑셀 원본 — 실제 거래 내역(상호·금액·계좌)이 담길 수 있어 올리지 않는다
+/output/
+outputs/
+backups/
+hh_backups/
+*.xlsx
+
+# 임시 작업 폴더와 눈으로 확인하려고 찍은 화면 그림
+tmp/
+.screenshots/
+
+# 운영 스크립트가 남기는 실행 기록
+scripts/.journal_*
