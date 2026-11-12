@@ -19,6 +19,9 @@
 //   E. 헤더 줄바꿈 0    : 열이 헤더보다 좁아 헤더가 두 줄로 꺾이지 않는가
 //   G. **select 값 잘림 0** : 선택된 option 글자가 칸을 넘지 않는가 (F 는 select 를 제외하므로 별도, 설계 125)
 //   H. **줄 꺾임 0**      : 한 텍스트가 두 줄로 꺾이지 않는가 — 요소를 쌓은 '의도된 2줄'과는 구분한다
+//   I. **표 넘침 0**    : 표가 껍데기보다 넓어 오른쪽 열이 가려지지 않는가.
+//       I 는 부모엔 자리가 있는데 껍데기만 좁은 경우(모든 폭), I-2 는 넓은 화면(1440 이상)에서
+//       표가 본문 전체보다 넓은 경우다. 좁은 화면에서 넓은 표가 넘치는 것은 보지 않는다.
 //   F. **글자 잘림 0**  : truncate(overflow:hidden)로 **글자가 실제로 잘려 사라진** 셀이 없는가 (설계 123)
 //       ★D 로는 절대 못 잡는다 — D 는 `overflowX === "visible"` 인 것만 보므로 truncate 를
 //         **일부러 건너뛴다**(설계 120 이 truncate 를 정답으로 삼았기 때문). 그래서 검사기가
@@ -72,7 +75,18 @@ const CUT_ROWS = 500;
 // ★2026-08-11: 중간 폭 1280 을 넣었다. 768(md 진입)·1920(넓은 쪽)만 보던 탓에 **그 사이에서만
 //   나는 결함**을 놓쳤다 — 지출 2단 보기의 '금액' 열 잘림(설계 145 이후 계속)이 그것이다.
 //   1280 은 2단 각 단이 가장 좁아지는 구간이라 잘림이 제일 크게 드러난다(실측 124px).
-const VIEWPORTS = process.env.VW ? [Number(process.env.VW)] : [768, 1280, 1920];
+// ★2026-11-12: 1440 을 넣었다. 대출관리 표를 1192 → 1216 으로 넓혔을 때 768·1280·1920 은 전부 통과했는데
+//   1440 에서만 오른쪽 '잔액' 끝이 17px 잘렸다(책에 싣는 그림이 1440 이라 그대로 찍혔다).
+//   이유는 둘이다. ① 1280 이하는 본문이 표보다 좁아 검사 I 가 "화면이 좁은 탓"으로 넘기고,
+//   1920 은 본문(1242)이 넉넉해 넘치지 않는다 — **본문이 1200 안팎인 1440 만 사이에 끼어 있었다.**
+//   ② 검사 I 는 "부모엔 자리가 있는데 껍데기만 좁은" 경우만 본다. 표가 본문 전체보다 넓은 것은 못 잡는다.
+//   그래서 폭을 넣는 것만으로는 모자라 아래 I-2 를 함께 넣었다.
+const VIEWPORTS = process.env.VW ? [Number(process.env.VW)] : [768, 1280, 1440, 1920];
+// I-2 를 적용하는 폭의 하한. 이 폭부터는 "화면이 좁아서"가 핑계가 못 된다 —
+// 1440 에서 표 껍데기 안쪽이 1199px(= 1440 − 사이드 메뉴 201 − 본문 좌우 여백 38 − 테두리 2)이고,
+// 열 폭 주석들이 말해 온 "표 합계 상한 1200" 이 바로 이 값이다. 그보다 좁은 화면(1366 은 1125)은
+// 넓은 표가 넘칠 수밖에 없어 I-2 로 보지 않는다.
+const WIDE_FROM_PX = 1440;
 
 // ── .env.local (로그인 정보) ───────────────────────────────────────────────
 const envPath = path.join(process.cwd(), ".env.local");
@@ -155,7 +169,7 @@ async function launch(): Promise<{ browser: Browser; which: string }> {
 }
 
 type Violation = { route: string; tab: string; table: string; kind: string; detail: string };
-type Measured = { sig: string; exempt: string | null; slackExempt: string | null; cols: number[]; pads: string[]; ctrl: string[]; over: string[]; cut: string[]; wrap: string[]; rowsSeen: number; slack: (number | null)[]; headWrap: string[]; clip: string | null };
+type Measured = { sig: string; exempt: string | null; slackExempt: string | null; wideExempt: string | null; wideOver: string | null; cols: number[]; pads: string[]; ctrl: string[]; over: string[]; cut: string[]; wrap: string[]; rowsSeen: number; slack: (number | null)[]; headWrap: string[]; clip: string | null };
 
 // 페이지 안에서 실행되는 측정기. 반환값은 순수 데이터(판정은 밖에서 한다).
 // ★함수가 아니라 **문자열**로 넘긴다 — tsx(esbuild)가 함수에 __name 헬퍼를 심어 두는데
@@ -170,6 +184,8 @@ const MEASURE = `(() => {
     // A'(슬랙 균등)만 빼는 표식. data-uniform-exempt 는 잘림·줄꺾임까지 통째로 끄기 때문에
     // "폭은 다른 탭에 맞춰야 해서 이 탭 슬랙은 못 맞춘다" 같은 경우엔 과하다. (2026-08-02)
     const slackExempt = t.getAttribute("data-slack-exempt");
+    // I-2(넓은 화면 넘침)만 빼는 표식. 이미 알고 있는 넘침을 이유와 함께 드러내 두는 용도다(새로 달지 말 것).
+    const wideExempt = t.getAttribute("data-wide-exempt");
     // 헤더 수와 칸 수가 같은 본문 행들을 본다(colSpan 안내행·합계행 제외).
     // ★첫 행만 보면 2번째 행 이후의 위반을 통째로 놓친다(교차리뷰 지적) → ROWS 줄까지 훑는다.
     const allRows = [...t.querySelectorAll("tbody tr")]
@@ -190,6 +206,11 @@ const MEASURE = `(() => {
     //   **껍데기가 표보다 좁으면 그 자체가 규칙 위반**이다(가로 스크롤은 의도가 아니다).
     // ⚠️이 블록은 백틱 템플릿 문자열(MEASURE) 안이다 — 주석에도 백틱을 쓰면 문자열이 끊긴다.
     let clip = null;
+    // ── I-2. ★넓은 화면에서 표가 본문보다 넓은가 (2026-11-12 신설) ──────────
+    // I 는 부모에 자리가 있을 때만 잡는다. 표가 본문 전체보다 넓으면 "화면이 좁은 탓"으로 넘어가는데,
+    // 넓은 화면(WIDE_FROM_PX 이상)에서는 그게 핑계가 못 된다 — 표가 설계 상한을 넘은 것이다.
+    // 여기서는 넘친 사실만 돌려주고, 어느 폭부터 위반으로 볼지는 밖에서 정한다.
+    let wideOver = null;
     {
       let sc = t.parentElement;
       while (sc) {
@@ -206,13 +227,18 @@ const MEASURE = `(() => {
         //   진짜 결함은 **부모에는 자리가 있는데 껍데기만 좁은 경우**다(2단 분할처럼 폭을 나눠 쓴 탓).
         //   그래서 부모가 표를 담을 수 있을 때만 잡는다.
         const room = sc.parentElement ? sc.parentElement.clientWidth : 0;
+        // 어느 열부터 잘리는지 — 누적 폭이 껍데기 안쪽 폭을 넘는 첫 열.
+        let acc = 0, firstCut = null;
+        if (over > 1) for (let i = 0; i < ths.length; i++) {
+          acc += ths[i].getBoundingClientRect().width;
+          if (acc > sc.clientWidth + 1) { firstCut = ((ths[i].textContent || "").trim() || (i + 1) + "열"); break; }
+        }
+        if (over > 1 && room < tw - 1) {
+          wideOver = "표 " + round(tw) + "px 가 껍데기 " + round(sc.clientWidth) + "px 를 +" + over + "px 넘침"
+                   + " (본문 전체가 " + round(room) + "px 뿐이다 = 표 합계가 상한을 넘었다)"
+                   + (firstCut ? " — '" + firstCut + "' 열부터 가려진다" : "");
+        }
         if (over > 1 && room >= tw - 1) {
-          // 어느 열부터 잘리는지 — 누적 폭이 껍데기 안쪽 폭을 넘는 첫 열.
-          let acc = 0, firstCut = null;
-          for (let i = 0; i < ths.length; i++) {
-            acc += ths[i].getBoundingClientRect().width;
-            if (acc > sc.clientWidth + 1) { firstCut = ((ths[i].textContent || "").trim() || (i + 1) + "열"); break; }
-          }
           clip = "표 " + round(tw) + "px 가 껍데기 " + round(sc.clientWidth) + "px 를 +" + over + "px 넘침"
                + " (부모엔 " + round(room) + "px 자리가 있다 = 레이아웃이 쪼갠 탓)"
                + (firstCut ? " — '" + firstCut + "' 열부터 잘린다" : "");
@@ -434,7 +460,7 @@ const MEASURE = `(() => {
         }
       }
     }));
-    return { sig, exempt, slackExempt, cols, pads, ctrl, over, cut, wrap, rowsSeen: bodyRows.length, slack, headWrap, clip };
+    return { sig, exempt, slackExempt, wideExempt, wideOver, cols, pads, ctrl, over, cut, wrap, rowsSeen: bodyRows.length, slack, headWrap, clip };
   });
 })()`;
 
@@ -521,6 +547,13 @@ try {
           if (m.over.length) add("D 칸 넘침", m.over.join(" · "));
           // I. 표가 껍데기를 넘어 오른쪽 열이 잘린다(2026-08-11 신설). data-uniform-exempt 만 면제.
           if (m.clip) add("I 표가 껍데기 넘침", m.clip);
+          // I-2. 넓은 화면인데 표가 본문보다 넓다(2026-11-12 신설). 좁은 화면에서는 보지 않는다.
+          if (m.wideOver && vw >= WIDE_FROM_PX) {
+            if (m.wideExempt) {
+              const line = `${route} · ${m.sig} — I-2 만 면제(알려진 넘침), 이유: ${m.wideExempt}`;
+              if (!exempted.includes(line)) exempted.push(line);
+            } else add("I-2 넓은 화면에서 표 넘침", m.wideOver);
+          }
           if (m.headWrap.length) add("E 헤더 줄바꿈", `${m.headWrap.join(" · ")} — 그 열을 한 슬롯 넓히거나 헤더 문구를 줄일 것`);
           if (m.wrap.length) add("G/H 잘림·줄꺾임", `${m.wrap.join(" · ")} — 그 열을 필요폭 이상 슬롯으로 넓히거나 표시 문자열을 줄일 것 (설계 125)`);
           if (m.cut.length) add("F 글자 잘림", `${m.cut.join(" · ")} — truncate 말고 HH_CELL.wrapText 로 줄바꿈할 것 (설계 123)`);
@@ -565,6 +598,8 @@ if (violations.length) {
   console.log("             부모엔 자리가 있는데 껍데기만 좁다는 뜻이므로 **레이아웃**을 고친다");
   console.log("             (2단을 끄거나 단 폭을 늘린다). 열을 줄여 표를 좁히는 건 줄꺾임과");
   console.log("             맞바꾸는 것이니 G/H 를 함께 보고 정할 것 (설계 162 ⑨).");
+  console.log("  I-2 넓은폭: " + WIDE_FROM_PX + "px 이상 화면인데 표가 본문보다 넓다 = 표 합계가 상한(1440 에서 1199px)을 넘었다.");
+  console.log("             열 폭 합계를 줄인다. 1920 에서 잰 본문 폭을 상한으로 삼지 말 것.");
   console.log("  진짜 예외면 <table> 에 data-uniform-exempt=\"<이유>\" 를 단다(남용 금지).");
 }
 process.exit(violations.length === 0 ? 0 : 1);

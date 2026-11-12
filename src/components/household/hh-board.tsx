@@ -69,6 +69,12 @@ interface HhBoardProps<T> {
    * 전체가 정렬**된다(두 표를 따로 만들면 안 되는 이유).
    */
   twoUp?: boolean;
+  /**
+   * 열 간격 고르기 검사(test:table-render 의 A')에서 **이 표만** 뺄 때 그 이유를 적는다 — <table> 에
+   * `data-slack-exempt` 로 나간다. 잘림·줄꺾임 검사는 그대로 살아 있다.
+   * 탭끼리 열 폭을 같이 쓰는데 한 탭의 값만 유난히 짧아, 폭으로는 맞출 수 없을 때만 쓴다(남용 금지).
+   */
+  slackExempt?: string;
   emptyText?: string;
   /** 빈 상태에서 보여줄 다음 행동(등록 버튼 등). 검색 결과 빈 상태에는 넘기지 않는 것을 권장. */
   emptyAction?: ReactNode;
@@ -259,6 +265,7 @@ export function HhBoard<T>({
   sortable = false,
   pageSize: pageSizeProp = 15,
   twoUp = false,
+  slackExempt,
   emptyText = "표시할 항목이 없습니다.",
   emptyAction,
   loading = false,
@@ -394,7 +401,7 @@ export function HhBoard<T>({
       >
         {tableParts.map(({ segs, slice, numberBase, withFooter }, ti) => {
         const table = (
-        <table key={ti} className={HH_TABLE.table} style={{ width: tableMinPx }}>
+        <table key={ti} className={HH_TABLE.table} style={{ width: tableMinPx }} data-slack-exempt={slackExempt}>
           {/* 열 폭은 여기 한 곳에서만 준다 — th/td className 에 폭을 섞으면 출처가 갈라진다. (설계 122) */}
           <colgroup>
             {colStyles(colWidths).map((st, i) => (

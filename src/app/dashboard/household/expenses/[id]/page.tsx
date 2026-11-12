@@ -17,7 +17,7 @@ import type { HhTransaction } from "@/lib/household/types";
 
 export default function HouseholdExpenseDetailPage() {
   const supabase = useMemo(() => browserDb(), []);
-  const { mask } = usePrivacyMode();
+  const { mask, enabled: privacyOn } = usePrivacyMode();
   const params = useParams();
   const router = useRouter();
   const id = params.id as string;
@@ -58,6 +58,11 @@ export default function HouseholdExpenseDetailPage() {
 
   const handleDelete = async () => {
     if (!row || deleting) return;
+    // 가림 모드에서는 삭제하지 않는다 — 확인창에 실제 값이 그대로 나온다.
+    if (privacyOn) {
+      toast.info("마스킹 모드에서는 삭제할 수 없습니다");
+      return;
+    }
     if (!confirm(`${row.txn_date} · ${row.amount.toLocaleString("ko-KR")}원 지출을 삭제하시겠습니까?`)) return;
     setDeleting(true);
     const { error: err } = await supabase.from("hh_transaction").delete().eq("id", id);

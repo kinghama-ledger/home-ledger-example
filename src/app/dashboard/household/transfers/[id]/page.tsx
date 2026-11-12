@@ -15,7 +15,7 @@ import type { HhTransaction } from "@/lib/household/types";
 
 export default function HouseholdTransferDetailPage() {
   const supabase = useMemo(() => browserDb(), []);
-  const { mask } = usePrivacyMode();
+  const { mask, enabled: privacyOn } = usePrivacyMode();
   const params = useParams();
   const router = useRouter();
   const id = params.id as string;
@@ -52,6 +52,11 @@ export default function HouseholdTransferDetailPage() {
 
   const handleDelete = async () => {
     if (!row || deleting) return;
+    // 가림 모드에서는 삭제하지 않는다 — 확인창에 실제 값이 그대로 나온다.
+    if (privacyOn) {
+      toast.info("마스킹 모드에서는 삭제할 수 없습니다");
+      return;
+    }
     if (!confirm(`${row.txn_date} · ${row.amount.toLocaleString("ko-KR")}원 이체를 삭제하시겠습니까?`)) return;
     setDeleting(true);
     const { error: err } = await supabase.from("hh_transaction").delete().eq("id", id);
@@ -86,7 +91,7 @@ export default function HouseholdTransferDetailPage() {
         <HhField label="출금계좌" value={mask("owner_name", names.from)} />
         <HhField label="입금계좌" value={mask("owner_name", names.to)} />
         <HhField label="금액" value={<span className="tabular-nums">{mask("amount", `${row.amount.toLocaleString("ko-KR")}원`)}</span>} />
-        <HhField label="메모" value={row.memo ?? "-"} />
+        <HhField label="메모" value={row.memo ? mask("merchant", row.memo) : "-"} />
       </Panel>
     </Screen>
   );

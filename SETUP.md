@@ -291,6 +291,7 @@ vercel deploy --prod --yes
 | `db push` 가 연결·권한 오류 | 새 프로젝트면 1~2분 기다립니다. 그래도 안 되면 `login` 과 `link` 를 다시 |
 | 비밀번호가 짧다고 한다 | 6자 이상이어야 합니다 |
 | `seed:demo` 가 실패한다 | `setup:admin` 을 먼저 했는지, `.env.local` 의 `SUPABASE_SERVICE_ROLE_KEY` 가 찼는지 봅니다 |
+| 화면이 비고 `permission denied for table hh_...` 오류가 난다 | 표에 접근 권한이 붙지 않은 것입니다. 예제의 새 판을 받은 뒤(`git pull template main` 또는 `git pull`) `npx supabase db push` 를 다시 돌리면 권한을 명시하는 마이그레이션이 올라갑니다 |
 | 로그인이 안 된다 | 이메일이 아니라 `admin`. 비밀번호를 잊었으면 `npm run setup:admin` 을 다시 돌려 새로 나온 값으로. 여러 번 틀리면 잠시 막히니 조금 기다립니다 |
 | 화면 대신 "Supabase 접속 값이 없습니다" 오류 | `.env.local` 이 없거나 주소·`anon` 키가 비었습니다. 4번대로 채우고 `npm run dev` 를 다시 켭니다 |
 | 로그인하지 않았는데 화면이 열리고 자료가 비어 있다 | 앱이 Supabase 에 닿지 못한 것입니다. 연결이 끊겼을 때 쓰던 사람이 쫓겨나지 않도록 화면은 열어 두는데, 자료는 못 불러와 빕니다. `.env.local` 의 주소가 맞는지 보고, Supabase 화면에서 프로젝트가 멈춰(Paused) 있으면 **Restore** 를 누른 뒤 몇 분 기다렸다가 `npm run dev` 를 다시 켭니다 |

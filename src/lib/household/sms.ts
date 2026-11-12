@@ -138,6 +138,28 @@ export function parseSmsTime(text: string): string | null {
   return `${String(chosen.hh).padStart(2, "0")}:${String(chosen.mm).padStart(2, "0")}`;
 }
 
+// 디지털온누리 결제 문자의 두 꼴. 앞머리 [Web발신] 은 통신사가 붙이는 머리말이라 허용한다. (설계 213)
+const ONNURI_PAYMENT_DONE_RE = /^(?:\[Web발신\]\s*)?결제되었어요\s+.+?님,\s*(.+?)에서\s*([0-9][0-9,]*)원이\s*결제되었어요[.!]?$/;
+const ONNURI_APPROVAL_RE = /^(?:\[Web발신\]\s*)?결제\s+온누리\([^)]*\).+?님\s+\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}\/(?:일시불|할부[^/]*)\/(?:승인|취소)\/[0-9][0-9,]*원\/(.+)$/;
+
+/** 설계 213: "결제되었어요 …님, {상호}에서 {금액}원이 결제되었어요" 꼴. */
+export function isOnnuriPaymentDoneSms(text: string): boolean {
+  return ONNURI_PAYMENT_DONE_RE.test((text ?? "").replace(/\s+/g, " ").trim());
+}
+
+/** 설계 213: "결제 온누리(…)…님 MM/DD HH:MM/일시불|할부…/승인|취소/금액원/상호" 꼴. */
+export function isOnnuriApprovalSms(text: string): boolean {
+  return ONNURI_APPROVAL_RE.test((text ?? "").replace(/\s+/g, " ").trim());
+}
+
+function extractOnnuriMerchant(text: string): string | null {
+  const t = (text ?? "").replace(/\s+/g, " ").trim();
+  const done = t.match(ONNURI_PAYMENT_DONE_RE);
+  if (done?.[1]?.trim()) return done[1].trim();
+  const approval = t.match(ONNURI_APPROVAL_RE);
+  return approval?.[1]?.trim() || null;
+}
+
 // 종류 판별: 키워드 우선순위(겹침 주의 — 자동이체⊃이체, 승인취소⊃승인).
 function detectKind(t: string): SmsKind {
   if (/취소/.test(t)) return "cancel";
@@ -300,6 +322,9 @@ function extractMerchant(t: string, raw: string): string | null {
     .split(/\r?\n/)
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter((line) => line.length > 0);
+  // 디지털온누리 두 전용 꼴은 일반 금액 뒤/시각 뒤 후보보다 먼저 잡는다. 상호 법인표기도 원문 그대로 둔다. (설계 213)
+  const onnuri = extractOnnuriMerchant(t);
+  if (onnuri) return onnuri;
   // 페이스페이 셋째 꼴: "{금액}원 결제 페이스페이 · 토스뱅크 · {가맹점} · 포인트 N원 사용". (설계 222)
   // 파이프가 없어 앞의 규칙들을 다 비껴가고, 일반 경로는 줄 전체를 상호로 삼아
   // `페이스페이 · 토스뱅크 · 해봄식당 · 포인트` 같은 한 번 쓰고 버려지는 학습키를 만든다.
@@ -485,7 +510,7 @@ function extractMerchant(t: string, raw: string): string | null {
   if (bank?.[1]) {
     const desc = bank[1].trim();
     const inst = extractInstitution(desc); // 해봄저축은행·KB카드 등 기관/카드사 우선
-    if (inst) return inst;
+    if (inst && !isOtherCompanyAfter(desc, inst)) return inst;
     const cleaned = stripMerchantNoise(desc); // 기관 아니면(지로·사람이름 등) 노이즈만 정리
     if (cleaned) return normalizeMerchantName(cleaned); // 법인표기 정리(설계 154) — '(주)푸르미' → '푸르미'
   }
@@ -579,6 +604,19 @@ const INSTITUTION_RE = /[가-힣A-Za-z]{2,}(?:저축은행|은행|뱅크|카드|
 const INSTITUTION_BLACKLIST = new Set(["카드", "체크카드", "신용카드", "법인카드", "가상카드", "선불카드", "기프트카드"]);
 
 /** 기관명(은행/카드사/페이) 추출. 명시 목록 중 가장 앞(동률이면 가장 긴 것)을 우선, 없으면 접미사 패턴 첫 매칭(일반 카드유형 제외). */
+// 은행 출금 적요에서 기관명 **뒤에 글자가 더 붙어** 다른 회사 이름이 되는 경우. (설계 208)
+// `카카오페이손해보험 출금` 이 기관 '카카오페이'로 잘려 상대처가 '카카오페이'가 되면 충전 이체 규칙
+// (완전일치)이 발동해 보험료가 지출에서 사라진다. 적요는 잘려 오기도 해서(`카카오페이손보`) 목록 대신
+// '거래어가 아닌 글자가 바로 붙었는가'로 본다. ★카카오페이에만 건다 — 전 기관에 걸면 이미 쓰는
+// `토스+명의 오픈뱅킹출금` → '토스' 같은 판정이 바뀐다.
+const OTHER_COMPANY_CHECK_INSTS = new Set(["카카오페이"]);
+function isOtherCompanyAfter(desc: string, inst: string): boolean {
+  if (!OTHER_COMPANY_CHECK_INSTS.has(inst)) return false;
+  const rest = desc.slice(desc.indexOf(inst) + inst.length);
+  // 머니·결제는 회사 이름이 아니라 카카오페이 자신의 서비스 표기라 종전대로 기관으로 자른다.
+  return /^[가-힣A-Za-z]/.test(rest) && !/^(출금|입금|충전|이체|송금|머니|결제)/.test(rest);
+}
+
 export function extractInstitution(text: string): string | null {
   const t = (text ?? "").replace(/\s+/g, " ");
   let best: { name: string; idx: number } | null = null;
@@ -744,7 +782,10 @@ export function parseSms(text: string, sender?: string | null): SmsParsed {
   //   (교차리뷰: c5 정규식이 맞았다는 것과 끝4의 출처가 c5 라는 것은 다르다 — 마스킹 c1·c2 가 이겼으면 폴백하지 않는다)
   const c5Used = c5 != null && cardLast4 === c5[1] && !c2 && !c1;
   // 새 6-2-6 마스크는 KB 전용인데 푸시에 은행명이 없으므로, 정확한 마스크가 있을 때만 기관을 보완한다. (설계 193)
-  const institution = extractInstitution(t) ?? (c5Used ? "KB국민카드" : null) ?? (kbAccountMask ? "KB국민은행" : null);
+  // 디지털온누리는 전역 기관 목록에 넣지 않는다 — 이름에 '온누리'가 든 일반 상호를 기관으로 오인하지 않도록
+  // 문형 자체가 근거일 때만 지정한다. (설계 213)
+  const onnuriInstitution = isOnnuriPaymentDoneSms(t) || isOnnuriApprovalSms(t) ? "디지털온누리" : null;
+  const institution = onnuriInstitution ?? extractInstitution(t) ?? (c5Used ? "KB국민카드" : null) ?? (kbAccountMask ? "KB국민은행" : null);
   if (cardLoanNotice) merchant = institution ?? merchant; // 카드사명이 사전에 없으면 기존 상호(발신자 폴백)를 남긴다
   // 파이프 없는 카드 SMS의 상품명(예: "현대카드Z 승인")도 보존한다.
   //   ★현대카드는 같은 카드를 "현대카드Z 승인"·"현대 Z 승인"(카드 글자 생략) 두 형태로 보낸다(카페24 사례, Z 는 가상의 상품코드).
@@ -793,6 +834,57 @@ export function isCardBillDoneNotice(text: string): boolean {
   if (/[0-9][\d,]*\s*원|승인|취소|출금|입금|이체|송금/.test(between)) return false;
   if (/실패|부족|미출금|미납|미결제|잔여|거절|거부|연체|불가|되지\s*(?:않|못)|못\s*했|안\s*(?:됐|되)|취소|일부|부분/.test(t)) return false;
   return !/[0-9][\d,]*\s*원/.test(t.slice(body.index + body[0].length));
+}
+
+/**
+ * 결제창에 넣을 인증번호 안내인가 — skipDisposition 규칙 3-5e 가 true 면 ignore-trace 로 보낸다. (설계 207)
+ * 결제 완료가 아니라 '이 번호를 넣으면 N원이 결제된다'는 조건부 안내라, 수집함에 올리면 없는 지출이 생긴다.
+ * `인증번호`와 `입력 시/하시면/하면` 뒤의 금액+결제/승인 꼴을 함께 요구해 일반 인증 문자와 거래 문자를 구분한다.
+ * `승인번호`는 거래신호가 아니므로 제외한다. 반면 독립된 승인·출금·입금이나 결제 완료형은 실제 거래일 수 있어 발동하지 않는다.
+ *   · 실패·거절·시간초과 안내는 발동하지 않는다 — 이 규칙이 실패 안내(→ ignore-noise) 규칙보다 앞이라, 막지 않으면
+ *     `인증번호 입력 시 N원 결제 실패` 가 금액 실은 휴지통 행이 되고 복원하면 없는 지출이 생긴다.
+ *   · 조건 → 금액 → 결제/승인 을 한 문장 안, 가까운 거리로 묶는다 — 문장을 넘으면
+ *     `인증번호를 입력하면 로그인됩니다. [페이] 가게 N원 결제` 의 실결제가 휴지통으로 간다.
+ *     `입력 시간`(시간초과 안내)도 조건부 `입력 시` 로 읽지 않는다.
+ *   · 완료형(`결제됐어요`·`결제했어요`·`결제 성공`·`정상 처리되었습니다`·`결제취소`)은 실거래다.
+ *     조건부 `정상결제 됩니다`·`돼요` 는 완료형이 아니다.
+ *   · 실패어·완료형은 인증번호 조건 문장 조각(입력… N원 … 결제|승인 + 뒤 15자, `[`·문장끝에서 멈춤)에만 건다 —
+ *     문자 전체에 걸면 `유효시간 3분 초과 시 재요청`·`재사용 불가` 같은 흔한 꼬리말만으로 수집함에 샌다.
+ *     은행·카드 거래신호(승인·출금·입금)는 전체에 건다 — 그쪽은 새면 실거래가 사는 방향이다.
+ *   · 문장 경계: 줄바꿈을 보존하고 `다`·`요` 로 끝난 줄바꿈만 경계로 본다(`입력 시\nN원` 처럼 한 문장이 꺾인 꼴은 잇는다).
+ *     `example.com`·`1,234.5원` 처럼 뒤에 공백이 없는 마침표는 경계가 아니다.
+ */
+const OTP_SENT = String.raw`(?:[^.!?\n]|\.(?=\S)|(?<![다요])\n)`;
+const OTP_CLAUSE = new RegExp(
+  String.raw`입력\s*(?:시(?![간각작도])|하시면|하면)${OTP_SENT}{0,40}?[0-9][\d,]*(?:\.\d+)?\s*원${OTP_SENT}{0,20}?(?:결제|승인)[^.!?\n\[\]]{0,15}`,
+);
+export function isPaymentOtpNotice(text: string): boolean {
+  const t = (text ?? "").replace(/[^\S\n]+/g, " ");
+  if (!/인증\s*번호/.test(t)) return false;
+  const clause = OTP_CLAUSE.exec(t)?.[0];
+  if (clause == null) return false;
+
+  const failNotice = /실패|거절|거부|초과|불가|오류|미승인/.test(clause);
+  const bankCardTxnSignal = /승인(?!\s*번호)|출금|입금/.test(t);
+  const paymentDoneSignal = /결제\s*(?:가|를|이)?\s*(?:정상\s*)?(?:완료|성공|취소|처리\s*(?:되었|됐|완료)|되었|됐|했|하였)/.test(clause);
+  return !failNotice && !bankCardTxnSignal && !paymentDoneSignal;
+}
+
+/**
+ * 리볼빙 '다음달 결제일로 이월' 안내인가 — skipDisposition 규칙 3-5f 가 true 면 ignore-trace 로 보낸다. (설계 217)
+ * 문자 꼴(예시): "일부결제금액이월약정(리볼빙) 김*늘님 … 이용금액 중 18,400원이 다음달 결제일로 이월되었습니다."
+ * 돈이 나간 게 아니라 다음 달 카드대금으로 넘어간다는 안내다 — 지출로 확정하면 없는 지출이 생긴다.
+ * 판별: 리볼빙/이월약정 표식 + `N원 … 이월되었/됐` 완료 문구(금액과 이월 사이 25자 이내, `.!?` 를 넘지 않음 —
+ * 공백을 먼저 접으므로 줄바꿈은 경계가 아니다). `이월되었던 금액` 같은 관형형은 완료 문구가 아니다.
+ * 은행·카드 거래신호(승인·출금·입금)가 있으면 발동하지 않는다 — 리볼빙 문구가 붙은 실제 승인·출금은 살아야 한다.
+ * 거래신호는 넓은 쪽(`승인번호` 도 막음)을 쓴다 — 버려서 잃는 쪽이 비싸다.
+ * ignore-noise 가 아니라 ignore-trace — 금액이 다음 달 대금의 단서라 휴지통에 남긴다.
+ */
+export function isRevolvingCarryNotice(text: string): boolean {
+  const t = (text ?? "").replace(/\s+/g, " ");
+  if (!/리볼빙|이월\s*약정/.test(t)) return false;
+  if (!/[0-9][\d,]*\s*원[^.!?]{0,25}?이월\s*(?:되었|됐|처리\s*되었)(?!던)/.test(t)) return false;
+  return !/승인|출금|입금/.test(t);
 }
 
 /**
@@ -992,6 +1084,10 @@ export function skipDisposition(text: string, parsed: SmsParsed, sender?: string
   if (naverMembershipNotice && !txnSignal) return "ignore-trace";
   // 3-5d. 카드사 '결제금액 … 출금완료' 사후 안내 → 휴지통 흔적. 판별과 근거는 `isCardBillDoneNotice` 주석(설계 205).
   if (isCardBillDoneNotice(text)) return "ignore-trace";
+  // 3-5e. 결제 인증번호 안내 → 휴지통 흔적. 조건부 입력 뒤 금액+결제/승인 꼴만 잡고 완료 거래신호는 살린다. (설계 207)
+  if (isPaymentOtpNotice(text)) return "ignore-trace";
+  // 3-5f. 리볼빙 '다음달 결제일로 이월' 안내 → 휴지통 흔적. 실출금이 아니라 다음 달 대금으로 넘어간다는 안내다. (설계 217)
+  if (isRevolvingCarryNotice(text)) return "ignore-trace";
   // 3-5g. 토스 포인트 캐시백 적립 알림 → 휴지통 흔적. 통장 입금이 아니라 포인트 적립이라 확정하면 포인트 이체분과 이중이 된다. (설계 221)
   //       ★토스 앱 알림일 때만 발동한다 — 문자 경로(발신처 없음)나 다른 은행 앱의 같은 꼴은 통장 입금일 수 있다.
   if (isTossSender(sender) && isPointCashbackNotice(text)) return "ignore-trace";
@@ -1148,10 +1244,11 @@ export function isNonTransactionalSms(text: string, parsed: SmsParsed): boolean 
  * 미인식(trace-unknown) 문자를 휴지통에 남길 때의 dedup_hash. (설계 docs/household/56 결정 3)
  * 금액이 없어(smsDedupKey=null) 반복 도착 시 무한 적재되는 것을 막기 위해
  * 원문 앞 80자 + 날짜로 하루 1건으로 억제한다.
+ * 원문 앞머리는 sha256 으로만 남긴다 — 이 칸에 평문이 남으면 원문 보존 기한을 지나도 내용이 남는다.
  */
 export function skipDedupKey(text: string, date: string): string {
   const head = (text ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
-  return `skip|${head}|${date}`;
+  return `skip|${sha256Hex(head)}|${date}`;
 }
 
 /**
@@ -1212,9 +1309,19 @@ export function matchCardNameToMethod(
   return hits.length === 1 ? hits[0].id : null;
 }
 
+/** 문자열의 UTF-8 바이트 → sha256 hex. dedup 값은 호출부에서 만든 문자열을 그대로 해시한다. */
+function sha256Hex(raw: string): string {
+  return createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+/** 알림 원문 중복키. 접두는 조회 계약을 위해 유지하고 본문은 평문으로 남기지 않는다. */
+export function notificationDedupKey(title: string, text: string, minute: string): string {
+  return `noti|${sha256Hex([title, text, minute].join("|"))}`;
+}
+
 /** 인제스트 토큰 → sha256 hex. (클라이언트 Web Crypto SHA-256 hex와 동일 포맷) */
 export function hashIngestToken(raw: string): string {
-  return createHash("sha256").update(raw.trim(), "utf8").digest("hex");
+  return sha256Hex(raw.trim());
 }
 
 /**

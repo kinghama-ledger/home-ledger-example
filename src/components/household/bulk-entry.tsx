@@ -264,7 +264,10 @@ export function BulkEntry<Row, O>({
               {/* 열 폭 = 내용별(설계 122). 맨 끝은 행 삭제 버튼 전용 아이콘 열.
                   ★예전엔 '데이터 열은 전부 균등' 규칙 때문에 이 아이콘 열만 예외(data-uniform-exempt)로
                     빼야 했다. 이제는 아이콘 열도 척도(icon)를 쓰는 정상 열이라 예외가 필요 없다. */}
-              <table className="table-fixed text-sm" style={{ width: tableMinWidth(colWidths) }}>
+              {/* 여러 건 입력 표는 입력 칸이 많아(지출 8열 = 1200px) 카드 안쪽(1440 화면에서 1111px)보다 넓다 —
+                  오른쪽으로 밀어 가며 적는다. 새로 생긴 일이 아니라 처음부터 그랬다. 숨기지 않고
+                  시험 결과에 이유와 함께 찍히게 한다. 열을 줄여 카드 안에 넣으면 이 표식을 지운다. */}
+              <table className="table-fixed text-sm" style={{ width: tableMinWidth(colWidths) }} data-wide-exempt="알려진 넘침: 여러 건 입력 표는 입력 칸 합계가 카드 안쪽보다 넓어 가로로 밀어 쓴다">
                 <colgroup>
                   {colStyles(colWidths).map((st, i) => <col key={i} style={st} />)}
                 </colgroup>

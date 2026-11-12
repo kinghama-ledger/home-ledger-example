@@ -16,6 +16,7 @@ import { HH_TAB_SOLID } from "@/components/household/hh-tab-styles";
 import { usePrivacyMode } from "@/components/privacy/privacy-mode";
 import { accountTintMap, ACCOUNT_TINT_NONE } from "@/lib/household/account-color";
 import { browserDb } from "@/lib/backend/browser";
+import { maskNamesIn } from "@/lib/privacy/mask";
 import { formatManwon } from "@/lib/household/won-format";
 import { buildCardLoanEstimate, estimateMonthlyPayment, firstRepaymentMonth, isCardLoan } from "@/lib/household/loan-estimate";
 import { matchLoanPayments } from "@/lib/household/loan-match";
@@ -30,12 +31,16 @@ function won(n: number) {
 // 실측(measure_table_content.mts — 이 예제에는 없음, 패딩 px-4 환산)으로 필요폭을 재서 배정했다.
 // 예전 9열 11.11% 균등은 폐기 — 상환일 44px·이자율 52px 옆에만 80~89px 공백이 남았다.
 //
-// ★합계 1,190px — 페이지 콘텐츠 한도 1,198px(max-w-7xl 1280 − 좌우 패딩) 안이다.
+// ★합계 1,192px — 이 표의 상한은 **1,199px** 이다. 화면 폭 1440(노트북에서 흔한 폭)에서 표 껍데기 안쪽이
+//   1,199px 이기 때문이다(실측 2026-11-12: 1440 − 사이드 메뉴 201 − 본문 좌우 여백 38 − 테두리 2).
+//   ★1920 에서 잰 본문 폭(1,242)을 상한으로 삼지 마라 — 그 값을 믿고 1,216 으로 넓혔다가 1440 에서
+//     오른쪽 '잔액' 끝이 17px 잘렸다. 열을 넣거나 넓히려면 1440 에서 다시 재라(test:table-render 의 I-2 가 잡는다).
 //   설계 167 에서 '전월 출금'(112) 을 더하며 만기일을 100.2 → 연-월 표기로 줄여 88 에 넣었다.
-//   1,214px 이면 껍데기를 넘겨 오른쪽 '잔액'이 잘린다(검사 I). 열을 더 넣으려면 다시 재라.
 const LOAN_COL_WIDTHS: (number | undefined)[] = [
   HH_COL.xxwide,    // 대출명 — '현대카드-이바다-카드론(26.05)' 이 160 에서 두 줄로 꺾였다(필요 185, 설계 125)
-  HH_COL.wide,      // 출금계좌 (112.8) — 계좌명 ink 80.8
+  HH_COL.wide,      // 출금계좌 — 색 상자의 좌우 여백을 px-1 로 줄여 글자 자리 94.5 를 낸다(136 − 칸 여백 32 − 상자 9.5).
+                    //   은행명이 5자인 '카카오뱅크(김하늘)'(92)이 px-2(글자 자리 87)에서 두 줄로 꺾였다.
+                    //   열을 xwide(160)로 넓히는 길은 표 합계가 1,216 이 되어 못 간다(위 상한 참고)
   HH_COL.short,     // 만기일 — '2027-08'(연-월). 일자는 옆 '상환일' 열이 이미 보여준다(설계 167)
   HH_COL.icon,      // 상환일 — 내용 '25일'(56.8)보다 헤더 '상환일'(61.2)이 하한
   HH_COL.wide,      // 대출금액 (114.8)
@@ -48,9 +53,11 @@ const LOAN_COL_WIDTHS: (number | undefined)[] = [
 
 export default function HouseholdLoansPage() {
   const supabase = useMemo(() => browserDb(), []);
-  const { mask } = usePrivacyMode();
+  const { mask, enabled: privacyOn } = usePrivacyMode();
 
   const [loans, setLoans] = useState<HhLoan[]>([]);
+  // 등록된 사람 이름 — 대출명 안의 이름을 가릴 때만 쓴다(괄호 없이 적은 "주택담보대출-홍길동" 같은 이름).
+  const [personNames, setPersonNames] = useState<string[]>([]);
   const [accounts, setAccounts] = useState<HhAccount[]>([]);
   const [payments, setPayments] = useState<HhTransaction[]>([]);
   const [month, setMonth] = useState(thisMonthKey);
@@ -69,16 +76,19 @@ export default function HouseholdLoansPage() {
     // 두 달을 합쳐도 페이징 상한과 거리가 멀다(설계 162 ⑦의 1,000행 잘림과는 규모가 다르다).
     const { end } = rangeOfMonth(month);
     const { start: prevStart } = rangeOfMonth(shiftMonth(month, -1));
-    const [loanRes, payRes, acctRes] = await Promise.all([
+    const [loanRes, payRes, acctRes, personRes] = await Promise.all([
       supabase.from("hh_loan").select("*").order("current_balance", { ascending: false }),
       // ★정렬을 명시한다 — 잘릴 때 어느 행이 빠질지 정해져야 한다(교차리뷰 Minor).
       supabase.from("hh_transaction").select("*").eq("type", "payment")
         .gte("txn_date", prevStart).lte("txn_date", end).order("txn_date", { ascending: true }),
       supabase.from("hh_account").select("*").order("sort_order", { ascending: true }),
+      supabase.from("hh_person").select("name"),
     ]);
     // payRes 가 실패하면 상환 거래가 빈 배열이 되어 '당월 실제 상환'이 0원으로 보인다.
     // acctRes 실패는 출금계좌가 전부 '-'. 셋 다 가드에 넣는다.
-    const failed = [loanRes, payRes, acctRes].find((r) => r.error);
+    // personRes 가 실패하면 가림 모드에서 대출명 속 이름을 가리지 못한다 — 가림 중일 때만 실명을 보이느니 오류로 멈춘다.
+    // 가림이 꺼져 있으면 이름 목록이 없어도 대출 목록은 그대로 보여 준다(상세 화면과 같은 규칙).
+    const failed = [loanRes, payRes, acctRes, ...(privacyOn ? [personRes] : [])].find((r) => r.error);
     if (failed) {
       console.error("대출 조회 실패:", failed.error);
       toast.error("대출 목록을 불러오지 못했습니다.");
@@ -87,6 +97,7 @@ export default function HouseholdLoansPage() {
       return;
     }
     setLoans((loanRes.data ?? []) as HhLoan[]);
+    setPersonNames(((personRes.data ?? []) as { name: string }[]).map((p) => p.name));
     // ★상한에 닿으면 조용히 잘린다(설계 162 ⑦: 1,000행을 넘으면
     //   최근 거래가 통째로 빠지는데 오류가 나지 않는다). 두 달치 납부거래라 여유가 크지만, 침묵보다 낫다.
     const payRows = (payRes.data ?? []) as HhTransaction[];
@@ -97,7 +108,7 @@ export default function HouseholdLoansPage() {
     setPayments(payRows);
     setAccounts((acctRes.data ?? []) as HhAccount[]);
     setLoading(false);
-  }, [supabase, month]);
+  }, [supabase, month, privacyOn]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -267,12 +278,15 @@ export default function HouseholdLoansPage() {
 
   // 순서(10열): 대출명 · 출금계좌 · 만기일 · 상환일 · 대출금액 · 이자율 · 전월 출금 · 당월 계획 · 당월 출금 · 잔액.
   // 열 폭은 px 고정폭이다 — 위 LOAN_COL_WIDTHS 와 순서가 1:1 이라, 열을 넣고 뺄 때 그 배열도 함께 고친다.
+  // 대출명 가림 — 괄호 안 이름(owner_name)에 더해, 괄호 없이 적힌 등록 인물 이름도 바꾼다.
+  const maskLoanName = (name: string) => maskNamesIn(mask("owner_name", name), personNames, privacyOn);
+
   const loanColumns: HhBoardColumn<HhLoan>[] = ([
     // 긴 이름은 자르지 않고 줄바꿈한다(개발 규칙, 설계 123). 옛 규칙 "truncate + title" 은 폐기 —
     // title 은 마우스를 올려야 보여서 표를 훑을 땐 글자가 그냥 사라진 것과 같다.
     { key: "name", header: "대출명", align: "left", cell: (l) => (
-      <span className="flex min-w-0 items-center gap-2" title={mask("owner_name", l.name)}>
-        <span className={`${HH_CELL.wrapText} font-medium text-foreground`}>{mask("owner_name", l.name)}</span>
+      <span className="flex min-w-0 items-center gap-2" title={maskLoanName(l.name)}>
+        <span className={`${HH_CELL.wrapText} font-medium text-foreground`}>{maskLoanName(l.name)}</span>
       </span>
     ), footer: (rows) => <span className="whitespace-nowrap text-muted-foreground">합계 {rows.length}건</span> },
     { key: "account", header: "출금계좌", align: "left", cell: (l) => {
@@ -280,8 +294,9 @@ export default function HouseholdLoansPage() {
       if (!label) return <span className="block text-muted-foreground">-</span>;
       const text = mask("owner_name", label);
       // 소유자 색 상자 — 현금흐름 '출금계좌 / 결제계좌' 칸과 같은 체계(설계 127). 글자색은 tint 가 준다.
+      // ★좌우 여백만 현금흐름(px-2)보다 좁은 px-1 이다 — 이 표는 폭 여유가 7px 뿐이라 열을 못 넓힌다(LOAN_COL_WIDTHS 주석).
       return (
-        <span className={`flex w-full min-w-0 items-center rounded-md border px-2 py-1 ${(l.account_id && accountTint.get(l.account_id)) ?? ACCOUNT_TINT_NONE}`} title={text}>
+        <span className={`flex w-full min-w-0 items-center rounded-md border px-1 py-1 ${(l.account_id && accountTint.get(l.account_id)) ?? ACCOUNT_TINT_NONE}`} title={text}>
           <span className={HH_CELL.wrapText}>{text}</span>
         </span>
       );

@@ -5,7 +5,7 @@ import { serviceDb } from "@/lib/backend/service";
 import { CARD_BILL_ISSUER_RE, isCardOrLoanPayment, matchIncomeRule, matchIncomingFromRule, matchMerchantRule, matchTransferRule } from "@/lib/household/defaults";
 import { CATEGORY_NAME } from "@/lib/household/category-names";
 import { GENERIC_PAYEE, normalizeLoanPayee, pickReusableLoan } from "@/lib/household/loan-reuse";
-import { cardIssuerKey, counterpartyHasName, extractWalletBalance, extractWalletLabel, hashIngestToken, ignoreTraceGuessedType, isNumericCodeMerchant, isTossFacePay, kindToTxnType, matchCardNameToMethod, parseSms, seoulToday, shiftIsoDate, skipDedupKey, skipDisposition, smsDedupKey, walletChainLinks, walletLabelPick, WALLET_LABEL_HISTORY_LIMIT, type SmsKind, type SmsParsed, type WalletChainPrev, type WalletLabelHistoryRow } from "@/lib/household/sms";
+import { cardIssuerKey, counterpartyHasName, extractWalletBalance, extractWalletLabel, hashIngestToken, ignoreTraceGuessedType, isNumericCodeMerchant, isOnnuriApprovalSms, isOnnuriPaymentDoneSms, isTossFacePay, kindToTxnType, matchCardNameToMethod, parseSms, seoulToday, shiftIsoDate, skipDedupKey, skipDisposition, smsDedupKey, walletChainLinks, walletLabelPick, WALLET_LABEL_HISTORY_LIMIT, type SmsKind, type SmsParsed, type WalletChainPrev, type WalletLabelHistoryRow } from "@/lib/household/sms";
 import type { HhLoanTerms } from "@/lib/household/types";
 
 function firstString(source: Record<string, unknown>, keys: string[]): string | null {
@@ -83,6 +83,59 @@ export interface InboxGuess {
 
 interface AccountNumberCandidate {
   account_no: string | null;
+}
+
+interface OnnuriPaymentMethodCandidate {
+  id: string;
+  name: string | null;
+  is_active?: boolean | null;
+}
+
+/**
+ * 설계 213 결제수단 우선순위. 디지털온누리 승인/취소면 가맹점 학습값보다 문자 자체를 권위로 삼고,
+ * 이름에 `디지털온누리` 가 든 활성 결제수단이 정확히 하나일 때만 고른다. 후보가 모호하면 학습값으로 되돌아가지 않고 빈칸이다.
+ */
+export function resolveOnnuriPaymentMethod(
+  institution: string | null,
+  kind: SmsKind,
+  methods: readonly OnnuriPaymentMethodCandidate[],
+  learnedPaymentMethodId: string | null
+): { applies: boolean; paymentMethodId: string | null; methodName: string | null } {
+  if (institution !== "디지털온누리" || (kind !== "approve" && kind !== "cancel")) {
+    return { applies: false, paymentMethodId: learnedPaymentMethodId, methodName: null };
+  }
+  const hits = methods.filter((method) => method.is_active !== false && (method.name ?? "").includes("디지털온누리"));
+  return hits.length === 1
+    ? { applies: true, paymentMethodId: hits[0].id, methodName: hits[0].name }
+    : { applies: true, paymentMethodId: null, methodName: null };
+}
+
+type OnnuriSmsShape = "payment-done" | "approval";
+
+function onnuriSmsShape(text: string): OnnuriSmsShape | null {
+  if (isOnnuriPaymentDoneSms(text)) return "payment-done";
+  if (isOnnuriApprovalSms(text)) return "approval";
+  return null;
+}
+
+/**
+ * 설계 213 1:1 짝짓기: 디지털온누리는 결제 한 건에 문자가 두 꼴로 온다. 반대 꼴 수가 같은 꼴 수보다 많을 때만
+ * 새 문자를 duplicate 로 본다 — 같은 날 같은 금액을 두 번 결제해도 각 결제가 한 줄씩 남는다.
+ */
+export function isOnnuriPairedSmsDuplicate(incomingText: string, existingRawTexts: readonly string[]): boolean {
+  const incomingShape = onnuriSmsShape(incomingText);
+  if (!incomingShape) return false;
+  const incomingKind = parseSms(incomingText).kind;
+  let same = 0;
+  let opposite = 0;
+  for (const rawText of existingRawTexts) {
+    if (parseSms(rawText).kind !== incomingKind) continue;
+    const shape = onnuriSmsShape(rawText);
+    if (!shape) continue;
+    if (shape === incomingShape) same += 1;
+    else opposite += 1;
+  }
+  return opposite > same;
 }
 
 /** 문자에 보이는 계좌번호 조각과 유일하게 일치하는 등록 계좌를 고른다. */
@@ -543,6 +596,27 @@ export async function enrichParsed(
     matchedMethodName = hit?.name ?? null;
   }
 
+  // 디지털온누리는 문자 자체가 결제수단을 말한다. 가맹점 학습값보다 앞서 활성 이름 후보의 유일성을 판정한다. (설계 213)
+  const onnuriPaymentMethodApplies =
+    parsed.institution === "디지털온누리" && (parsed.kind === "approve" || parsed.kind === "cancel");
+  if (onnuriPaymentMethodApplies) {
+    const { data: onnuriMethods, error: onnuriMethodsError } = await supabase
+      .from("hh_payment_method")
+      .select("id, name, is_active")
+      .eq("owner_auth_uid", owner)
+      .eq("is_active", true)
+      .ilike("name", "%디지털온누리%");
+    if (onnuriMethodsError) console.error("[hh-inbox] 디지털온누리 결제수단 조회 실패:", onnuriMethodsError.message);
+    const resolved = resolveOnnuriPaymentMethod(
+      parsed.institution,
+      parsed.kind,
+      onnuriMethods ?? [],
+      learnedMerchantRule?.payment_method_id ?? null
+    );
+    guessedPaymentMethodId = resolved.paymentMethodId;
+    matchedMethodName = resolved.methodName;
+  }
+
   // 계좌번호/카드번호가 없는 간편결제 알림의 보수적 폴백.
   if (!guessedPaymentMethodId && parsed.institution === "한빛페이") {
     const { data: localMethods } = await supabase
@@ -821,9 +895,14 @@ export async function enrichParsed(
   // 납부(payment)의 출금계좌 우선순위(아래 finalFromId 주석)를 지키기 위해 '학습값으로 채웠는지'를 기억한다(설계 194).
   let accountFromLearnedRule = false;
   if (!unmatchedCardApproval && !learnedWalletMismatch && !cardIssuerClueUnresolved && !walletChainAuthority && !walletQueryFailed) {
-    if (guessedAccountId == null && learnedMerchantRule?.account_id != null) accountFromLearnedRule = true;
-    guessedAccountId ??= learnedMerchantRule?.account_id ?? null;
-    guessedPaymentMethodId ??= learnedMerchantRule?.payment_method_id ?? null;
+    // 디지털온누리는 학습 계좌도 쓰지 않는다 — 학습값은 같은 가게를 다른 카드(체크카드 계좌)로 낸 기록일 수 있다.
+    //   결제수단이 정해지면 연결계좌(설계 107)가, 못 정하면 빈칸이 답이다. (설계 213)
+    if (!onnuriPaymentMethodApplies) {
+      if (guessedAccountId == null && learnedMerchantRule?.account_id != null) accountFromLearnedRule = true;
+      guessedAccountId ??= learnedMerchantRule?.account_id ?? null;
+    }
+    // 디지털온누리는 후보가 0개·2개 이상이어도 빈칸이 결정값이다. 학습된 카드로 되돌아가면 안 된다.
+    if (!onnuriPaymentMethodApplies) guessedPaymentMethodId ??= learnedMerchantRule?.payment_method_id ?? null;
   }
 
   // 체크카드는 **카드에 연결된 계좌**에서 즉시 빠진다 — 그게 진실이다. 과거 오확정으로 학습된 계좌가
@@ -849,6 +928,32 @@ export async function enrichParsed(
     // merchant_map 이 학습한 은행계좌가 신용카드 결제에 그대로 붙는다.
     // 사례: 해오름커피한빛 7,598원 — 신용카드(명의 갑) 결제가 은행계좌(명의 갑)에서도 출금. (설계 117)
     if (pm?.kind === "credit" || pm?.kind === "installment") guessedAccountId = null;
+  }
+
+  // ★설계 117 의 거울상. 위 블록은 `!accountFromMessage` 일 때만 돌아서, 문자가 계좌를 직접 특정한
+  //   은행 출금 문자에는 학습값이 붙인 신용카드가 그대로 남는다. 돈은 그 순간 계좌에서 나갔으므로
+  //   계좌가 진실이고 결제수단이 거짓이다 — 계좌를 지우면 실제 출금이 장부에서 사라지니 지울 것은 카드 쪽이다.
+  //   조건:
+  //     · `accountFromMessage` — 문자가 계좌를 지목했다(즉시 출금 — 신용카드일 수 없다).
+  //     · `!methodFromMessage` — 문자가 끝4·카드명으로 지목한 카드는 증거가 있으니 건드리지 않는다.
+  //     · `credit`·`installment` 만 — `check`·`cash` 는 즉시 출금이라 은행 문자와 모순되지 않는다.
+  //   어느 체크카드인지는 문자가 말해 주지 않으므로 틀리게 채우느니 빈칸으로 둔다. 계좌가 남아 확정은 가능하다.
+  //   · 조회 실패는 fail-closed — 지우려는 값이 문자에 근거 없는 학습값이라, 종류를 확인 못 하면 비운다.
+  //   · 취소 문자 제외 — 아래 취소 대상 탐색이 결제수단으로 후보를 좁히므로, 비우면 같은 금액의 다른 카드
+  //     거래가 삭제 대상으로 지목될 수 있다. 환불에는 '그 순간 돈이 나갔다'는 전제도 성립하지 않는다.
+  //   · 할부 재분류 문자 제외 — 할부는 계좌를 비우므로 수단까지 비우면 둘 다 없어 확정이 막힌다. (설계 206)
+  if (accountFromMessage && !methodFromMessage && guessedPaymentMethodId && parsed.kind !== "cancel" && !isInstallment) {
+    const { data: learnedPm, error: learnedPmError } = await supabase
+      .from("hh_payment_method")
+      .select("kind")
+      .eq("id", guessedPaymentMethodId)
+      .maybeSingle();
+    if (learnedPmError) {
+      console.error(`[sms-ingest] 설계 206: 학습 결제수단 종류 조회 실패 — 안전하게 비운다: ${learnedPmError.message}`);
+      guessedPaymentMethodId = null;
+    } else if (learnedPm?.kind === "credit" || learnedPm?.kind === "installment") {
+      guessedPaymentMethodId = null;
+    }
   }
 
   // ── 이체 규칙 계좌 해석(설계 52 규칙의 from/to → 실제 계좌) ─────────────────── (설계 docs/household/129)
@@ -883,13 +988,17 @@ export async function enrichParsed(
       (accountFromMessage ? guessedAccountId : null) ?? (fromCands.length === 1 ? fromCands[0].id : null);
 
     // to = 출금계좌 주인의 지갑. 주인을 모르면 후보가 하나일 때만 채운다.
+    // ★주인을 **아는데** 그 주인의 지갑이 없으면 빈칸이다 — 후보 하나 폴백으로 넘어가면 남의 지갑이 채워진다
+    //   (지갑이 한 사람 것 하나뿐일 때 다른 가족의 충전이 그 지갑으로 들어간다). (설계 208)
     const toCands = byName(transferRule.to);
     const fromPerson = cands.find((a) => a.id === ruleFromAccountId)?.person_id ?? null;
     // ★주인의 지갑도 **하나일 때만** 채운다 — 이름 조각이 든 같은 주인 계좌가 둘이면 어느 쪽인지 모른다(설계 226, 설계 105 원칙).
     const ownerToCands = fromPerson ? toCands.filter((a) => a.person_id === fromPerson) : [];
-    ruleToAccountId =
-      (ownerToCands.length === 1 ? ownerToCands[0].id : null) ??
-      (toCands.length === 1 ? toCands[0].id : null);
+    ruleToAccountId = fromPerson
+      ? (ownerToCands.length === 1 ? ownerToCands[0].id : null)
+      : toCands.length === 1
+        ? toCands[0].id
+        : null;
     // ★못 찾으면 조용히 null 로 두지 않는다 — 이체 확정이 막히는데 화면엔 이유가 안 보인다.
     if (!ruleToAccountId) {
       console.warn(
@@ -1128,13 +1237,23 @@ type DedupCandidate = {
   guessed_type?: string | null;
   guessed_from_account_id?: string | null;
   guessed_to_account_id?: string | null;
+  reported_balance?: number | null;
+  reported_balance_account_id?: string | null;
+  source?: string | null;
+  source_adapter?: string | null;
 };
-/** 들어오는 이체의 끝점 계좌. */
+/** 들어오는 이체의 끝점 계좌 + 메시지가 알려준 잔액(설계 211 — 같은 계좌 잔액이 다르면 다른 거래). */
 export type TransferEndpoints = {
   fromAccountId: string | null;
   toAccountId: string | null;
-  /** 문자·알림에 찍힌 잔액이 속한 계좌 — 계좌가 메시지로 증명됐는지 볼 때 쓴다. (설계 228) */
+  /** 문자·알림에 찍힌 잔액(원). (설계 211) */
+  reportedBalance?: number | null;
+  /** 문자·알림에 찍힌 잔액이 속한 계좌 — 계좌가 메시지로 증명됐는지 볼 때 쓴다. (설계 211·228) */
   reportedBalanceAccountId?: string | null;
+  /** 수집 경로(sms·notification). 잔액 비교는 같은 경로끼리만 한다. (설계 211) */
+  source?: string | null;
+  /** 알림 앱(source_adapter). 알림은 앱마다 잔액 뜻이 달라 같은 앱끼리만 비교한다. (설계 211) */
+  sourceAdapter?: string | null;
 };
 
 /**
@@ -1144,8 +1263,26 @@ export type TransferEndpoints = {
  * 후보가 이체가 아니면(카드결제 등) 이체와 같은 거래일 수 없으므로 '다른 것'(true)으로 본다.
  * 끝점을 비교할 수 없으면(한쪽 계좌 미상) 확신 못 하므로 false(=중복 후보로 남김, 보수적).
  */
-function isConfidentlyDifferentTransfer(inc: TransferEndpoints, cand: DedupCandidate): boolean {
+export function isConfidentlyDifferentTransfer(inc: TransferEndpoints, cand: DedupCandidate): boolean {
   if (cand.guessed_type !== "transfer") return true;
+  // 설계 211: 같은 계좌의 잔액이 둘 다 찍혀 있는데 값이 다르면 서로 다른 거래다 — 재전송·두 다리는
+  //   같은 계좌라면 같은 잔액을 보고한다. 끝점 공유 판정보다 먼저 본다(같은 날 같은 금액을 같은 경로로
+  //   두 번 보내면 끝점이 같아 둘째가 중복으로 사라진다).
+  //   ★같은 수집 경로끼리만 비교한다 — 문자와 앱 알림은 '잔액' 표기(출금가능잔액·총 보유 잔액)나 잔액 계좌
+  //   귀속이 달라 같은 거래도 값이 다를 수 있다. 알림은 앱이 달라도 전부 source='notification' 이라
+  //   같은 앱(source_adapter)끼리만 본다. 문자는 발신번호가 비어 오는 일이 많아 발신번호는 요구하지 않는다.
+  //   ※크로스소스 판정은 후보가 늘 다른 경로라 이 규칙이 발동하지 않는다 — 가족이체 판정에서만 쓰인다.
+  if (
+    inc.source &&
+    inc.source === cand.source &&
+    (inc.source === "sms" || (Boolean(inc.sourceAdapter) && inc.sourceAdapter === cand.source_adapter)) &&
+    inc.reportedBalance != null &&
+    cand.reported_balance != null &&
+    inc.reportedBalanceAccountId &&
+    inc.reportedBalanceAccountId === cand.reported_balance_account_id &&
+    Number(inc.reportedBalance) !== Number(cand.reported_balance)
+  )
+    return true;
   const shareTo = Boolean(inc.toAccountId && cand.guessed_to_account_id && inc.toAccountId === cand.guessed_to_account_id);
   const shareFrom = Boolean(inc.fromAccountId && cand.guessed_from_account_id && inc.fromAccountId === cand.guessed_from_account_id);
   if (shareTo || shareFrom) return false; // 끝점 공유 = 같은 이체의 다른 다리
@@ -1226,13 +1363,153 @@ export async function hasSameDayAmountSibling(
   return (data ?? []).length > 0;
 }
 
-/** 상호 비교용 키 — 전각을 반각으로, 법인표기·괄호·공백·구두점을 지우고 소문자로. (설계 228) */
+/** 상호 비교용 키 — 전각을 반각으로, 법인표기·괄호·공백·구두점을 지우고 소문자로. (설계 224·228) */
 function merchantCompareKey(s: string | null | undefined): string {
   return (s ?? "")
     .replace(/[！-～]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
     .replace(/\(\s*(?:주|유)\s*\)|㈜|주식회사|유한회사/g, "")
     .replace(/[\s()[\]·.,\-_/]/g, "")
     .toLowerCase();
+}
+
+/**
+ * 설계 213: 같은 owner·날짜·금액·kind 의 온누리 두 꼴을 1:1로 짝짓는다.
+ * confirmed/pending/duplicate 만 세고 ignored/archived 는 제외한다. 조회 실패 시 수집 유실을 막기 위해 false.
+ */
+export async function hasOnnuriPairedSmsDuplicate(
+  supabase: SupabaseClient,
+  owner: string,
+  incomingText: string,
+  kind: SmsKind,
+  date: string | null,
+  amount: number | null
+): Promise<boolean> {
+  if (!onnuriSmsShape(incomingText) || !date || amount == null) return false;
+  const { data, error } = await supabase
+    .from("hh_transaction_inbox")
+    .select("raw_text")
+    .eq("owner_auth_uid", owner)
+    .eq("guessed_date", date)
+    .eq("guessed_amount", amount)
+    .eq("guessed_kind", kind)
+    .in("status", ["pending", "confirmed", "duplicate"]);
+  if (error) {
+    console.error("[hh-inbox] 디지털온누리 두 꼴 중복 조회 실패:", error.message);
+    return false;
+  }
+  return isOnnuriPairedSmsDuplicate(
+    incomingText,
+    (data ?? []).map((row) => row.raw_text as string).filter((rawText) => typeof rawText === "string")
+  );
+}
+
+/** 설계 224: 두 알림의 상호가 같은 가게인가 — 한쪽이 다른 쪽을 품거나(잘림), 앞 4자가 같다. */
+export function onnuriPairMerchantMatches(a: string | null | undefined, b: string | null | undefined): boolean {
+  const x = merchantCompareKey(a);
+  const y = merchantCompareKey(b);
+  // 3자 미만은 비교하지 않는다 — 2자 포함은 다른 가게도 걸린다.
+  if (x.length < 3 || y.length < 3) return false;
+  if (x.includes(y) || y.includes(x)) return true;
+  return x.length >= 4 && y.length >= 4 && x.slice(0, 4) === y.slice(0, 4);
+}
+
+export interface OnnuriRelabelRow {
+  id: string;
+  status: string;
+  raw_text: string | null;
+  guessed_merchant: string | null;
+  guessed_account_id: string | null;
+  guessed_payment_method_id?: string | null;
+  guessed_kind: string | null;
+  collected_at: string;
+}
+
+/** 설계 224: 짝으로 볼 수집 간격 상한. 한 결제의 두 알림은 거의 동시에 온다. */
+export const ONNURI_PAIR_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * 설계 224: 디지털온누리를 체크카드에 연결하면 온누리 잔액 결제도 그 카드의 승인 알림("N원 결제 ○○체크 | 가게")으로 온다.
+ * 같은 결제에 온누리 앱의 "결제되었어요" 문자가 같이 오면 그 카드 알림은 은행 출금이 아니라 온누리 결제다.
+ * 같은 날·금액(호출자가 거름)·상호·수집 10분 안의 pending 카드 행을 온누리 신호와 1:1로 짝지어 바꿀 행을 고른다.
+ * 온누리 신호 = 결제되었어요·온누리 승인 꼴 문자 중 계좌가 정해진 것("일반결제되었어요"는 꼴 밖 = 통장 결제라 신호가 아니다).
+ * 반환: 바꿀 카드 행 id → 온누리 계좌 id.
+ */
+export function pickOnnuriCardRelabels(rows: readonly OnnuriRelabelRow[]): Map<string, string> {
+  const live = rows.filter((r) => r.guessed_kind === "approve" && r.status !== "ignored" && r.status !== "archived");
+  const signals = live
+    .filter((r) => r.guessed_account_id && onnuriSmsShape(r.raw_text ?? ""))
+    .sort((a, b) => a.collected_at.localeCompare(b.collected_at));
+  const onnuriAccounts = new Set(signals.map((s) => s.guessed_account_id as string));
+  const onnuriMethods = new Set(signals.map((s) => s.guessed_payment_method_id).filter((v): v is string => !!v));
+  // 카드 후보 = 통장에서 바로 빠지는 카드(체크카드 → 계좌가 정해짐) 또는 이미 온누리 수단으로 잡힌 행.
+  // 계좌 없는 신용카드 승인은 같은 날·금액·가게여도 온누리 결제가 아니다.
+  const cards = live.filter(
+    (r) => !onnuriSmsShape(r.raw_text ?? "") && (!!r.guessed_account_id || onnuriMethods.has(r.guessed_payment_method_id ?? ""))
+  );
+  const out = new Map<string, string>();
+  const used = new Set<string>();
+  // 신호 하나가 카드 행 하나만 바꾼다. 이미 온누리 계좌인 카드 행(사람이 고쳤거나 확정된 것)도 짝 하나를 차지한다.
+  // 우선순위: 이미 온누리인 행 → pending → 나머지(duplicate·confirmed). 같은 결제의 duplicate 카드 행이 시각만 가까워
+  // 짝을 가로채 pending 행이 은행 출금으로 남는 것을 막는다. 그다음 수집 간격.
+  const rank = (c: OnnuriRelabelRow) => (onnuriAccounts.has(c.guessed_account_id ?? "") ? 0 : c.status === "pending" ? 1 : 2);
+  for (const sig of signals) {
+    const t = Date.parse(sig.collected_at);
+    const pick = cards
+      .filter((c) => !used.has(c.id) && onnuriPairMerchantMatches(sig.guessed_merchant, c.guessed_merchant))
+      .map((c) => ({ c, gap: Math.abs(Date.parse(c.collected_at) - t) }))
+      .filter((x) => x.gap <= ONNURI_PAIR_WINDOW_MS)
+      .sort((a, b) => rank(a.c) - rank(b.c) || a.gap - b.gap)[0];
+    if (!pick) continue;
+    used.add(pick.c.id);
+    if (pick.c.status === "pending" && !onnuriAccounts.has(pick.c.guessed_account_id ?? "")) {
+      out.set(pick.c.id, sig.guessed_account_id as string);
+    }
+  }
+  return out;
+}
+
+/**
+ * 설계 224: 수집 직후(온누리 문자·카드 알림 어느 쪽이 늦게 와도) 같은 날·금액 행을 다시 보고 짝이 된 pending 카드 행을
+ * 계좌 = 디지털온누리 · 결제수단 = 빈칸으로 바꾼다. 실패해도 수집은 막지 않는다.
+ */
+export async function relabelOnnuriLinkedCardPayment(
+  supabase: SupabaseClient,
+  owner: string,
+  date: string | null,
+  amount: number | null
+): Promise<string[]> {
+  if (!date || amount == null) return [];
+  try {
+    const { data, error } = await supabase
+      .from("hh_transaction_inbox")
+      .select("id,status,raw_text,guessed_merchant,guessed_account_id,guessed_payment_method_id,guessed_kind,collected_at")
+      .eq("owner_auth_uid", owner)
+      .eq("guessed_date", date)
+      .eq("guessed_amount", amount)
+      .in("status", ["pending", "confirmed", "duplicate"]);
+    if (error) {
+      console.error("[hh-inbox] 온누리 연결카드 짝 조회 실패:", error.message);
+      return [];
+    }
+    const picks = pickOnnuriCardRelabels((data ?? []) as OnnuriRelabelRow[]);
+    const done: string[] = [];
+    for (const [id, accountId] of picks) {
+      // 그사이 확정·휴지통으로 바뀐 행은 0행 갱신이다 — 실제로 바뀐 행만 센다.
+      const { data: upRows, error: upErr } = await supabase
+        .from("hh_transaction_inbox")
+        .update({ guessed_account_id: accountId, guessed_payment_method_id: null })
+        .eq("id", id)
+        .eq("owner_auth_uid", owner)
+        .eq("status", "pending")
+        .select("id");
+      if (upErr) console.error("[hh-inbox] 온누리 연결카드 계좌 변경 실패:", upErr.message);
+      else if ((upRows ?? []).length > 0) done.push(id);
+    }
+    return done;
+  } catch (e) {
+    console.error("[hh-inbox] 온누리 연결카드 짝 처리 오류:", e instanceof Error ? e.message : e);
+    return [];
+  }
 }
 
 /**
@@ -1301,7 +1578,7 @@ async function findCrossSourceDuplicateCandidates(
   if (amount == null) return [];
   const { data, error } = await supabase
     .from("hh_transaction_inbox")
-    .select("id, source, status, created_at, guessed_type, guessed_merchant, guessed_account_id, guessed_from_account_id, guessed_to_account_id, reported_balance_account_id")
+    .select("id, source, status, created_at, guessed_type, guessed_merchant, guessed_account_id, guessed_from_account_id, guessed_to_account_id, reported_balance, reported_balance_account_id")
     .eq("owner_auth_uid", owner)
     .eq("guessed_date", date)
     .eq("guessed_amount", amount)
@@ -1383,6 +1660,7 @@ type CrossSourceCandidate = {
   guessed_account_id?: string | null;
   guessed_from_account_id?: string | null;
   guessed_to_account_id?: string | null;
+  reported_balance?: number | null;
   reported_balance_account_id?: string | null;
 };
 
@@ -1567,7 +1845,7 @@ export async function isDuplicateFamilyTransfer(
   if (amount == null) return false;
   const { data } = await supabase
     .from("hh_transaction_inbox")
-    .select("id, guessed_type, guessed_from_account_id, guessed_to_account_id")
+    .select("id, source, source_adapter, guessed_type, guessed_from_account_id, guessed_to_account_id, reported_balance, reported_balance_account_id")
     .eq("owner_auth_uid", owner)
     .eq("guessed_date", date)
     .eq("guessed_amount", amount)
@@ -1575,7 +1853,7 @@ export async function isDuplicateFamilyTransfer(
     .in("status", ["pending", "confirmed"]);
   const cands = data ?? [];
   if (cands.length === 0) return false;
-  if (incoming && (incoming.fromAccountId || incoming.toAccountId)) {
+  if (incoming && (incoming.fromAccountId || incoming.toAccountId || incoming.reportedBalanceAccountId)) {
     return cands.some((c) => !isConfidentlyDifferentTransfer(incoming, c));
   }
   return true;
@@ -1700,23 +1978,29 @@ export async function handleSmsIngest(request: NextRequest) {
       toAccountId: fields.guessed_to_account_id,
       merchant: fields.guessed_merchant,
       accountId: fields.guessed_account_id,
+      reportedBalance: fields.reported_balance,
       reportedBalanceAccountId: fields.reported_balance_account_id,
+      source: "sms",
     };
     // 같은 날짜·시각·금액 수집 건이 이미 있으면 이번 행은 휴지통(ignored)으로. (설계 163)
     // ★duplicate 탭이 아니라 휴지통이다 — 요구 사항. 크로스소스 판정보다 먼저 본다.
     const sameTimeDup = await hasSameTimeSibling(supabase, owner, parsed.kind, fields.guessed_date, fields.guessed_time, parsed.amount);
+    // 디지털온누리 한 결제의 두 문자 꼴은 같은 소스라 크로스소스 규칙 밖이다. 1:1 짝짓기 결과는 기존 duplicate 상태 경로로 넣는다. (설계 213)
+    const onnuriDup = sameTimeDup
+      ? false
+      : await hasOnnuriPairedSmsDuplicate(supabase, owner, smsText, parsed.kind, fields.guessed_date, parsed.amount);
     // 크로스소스 이중수집(알림 등 다른 소스가 같은 금액·날짜를 이미 수집)이면 duplicate로. (설계 docs/household/63)
     // 이체는 끝점 계좌로 '서로 다른 이체'를 구분해 오판 방지(보강 2026-07-19).
-    const crossDup = sameTimeDup ? false : await isCrossSourceDuplicate(supabase, owner, "sms", fields.guessed_date, parsed.amount, txEndpoints);
+    const crossDup = sameTimeDup || onnuriDup ? false : await isCrossSourceDuplicate(supabase, owner, "sms", fields.guessed_date, parsed.amount, txEndpoints);
     // 가족 내부 이체는 보낸/받은 쪽 2건으로 들어올 수 있어(같은 소스여도) 같은 날·금액이면 duplicate로. (설계 48·63)
-    const famDup = !sameTimeDup && familyTransfer ? await isDuplicateFamilyTransfer(supabase, owner, fields.guessed_date, parsed.amount, txEndpoints) : false;
+    const famDup = !sameTimeDup && !onnuriDup && familyTransfer ? await isDuplicateFamilyTransfer(supabase, owner, fields.guessed_date, parsed.amount, txEndpoints) : false;
 
     const row = {
       owner_auth_uid: owner,
       source: "sms",
       source_adapter: sender,
       raw_text: smsText,
-      status: sameTimeDup ? "ignored" : crossDup || famDup ? "duplicate" : "pending",
+      status: sameTimeDup ? "ignored" : onnuriDup || crossDup || famDup ? "duplicate" : "pending",
       dedup_hash: dedupHash,
       ...fields,
     };
@@ -1742,6 +2026,12 @@ export async function handleSmsIngest(request: NextRequest) {
       parsed.amount,
       txEndpoints
     );
+
+    // 온누리 결제 문자가 늦게 왔으면 먼저 들어온 연결 체크카드 알림 행을, 카드 승인 문자가 늦게 왔으면 그 행을
+    // 온누리 계좌로 바꾼다. (설계 224)
+    if (insertedId && !sameTimeDup && !trashedByRace && (onnuriSmsShape(smsText) || parsed.kind === "approve")) {
+      await relabelOnnuriLinkedCardPayment(supabase, owner, fields.guessed_date, parsed.amount);
+    }
 
     await supabase.from("hh_ingest_token").update({ last_used_at: new Date().toISOString() }).eq("id", tokenRow.id);
 

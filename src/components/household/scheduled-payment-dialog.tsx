@@ -24,6 +24,7 @@ import type {
   HhScheduledPaymentKind,
 } from "@/lib/household/types";
 import { SCHEDULED_KIND_LABEL } from "@/lib/household/types";
+import { payDayError } from "@/lib/household/pay-day";
 
 const selectClass =
   "flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-base md:text-sm shadow-xs focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50";
@@ -114,9 +115,8 @@ export function ScheduledPaymentDialog({
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.title.trim()) return toast.error("이름을 입력해주세요.");
-    if (form.frequency !== "weekly" && form.pay_day != null && (form.pay_day < 1 || form.pay_day > 28)) {
-      return toast.error("납부일은 1~28 사이여야 합니다.");
-    }
+    const dayError = payDayError(form.frequency, form.pay_day);
+    if (dayError) return toast.error(dayError);
     setSaving(true);
     try {
       await onSave({ ...form, title: form.title.trim() });
@@ -163,8 +163,8 @@ export function ScheduledPaymentDialog({
               </select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="sp-day">{weekly ? "요일 (0=일)" : "납부일 (1~28)"}</Label>
-              <Input id="sp-day" type="number" min={weekly ? 0 : 1} max={weekly ? 6 : 28} value={form.pay_day ?? ""} onChange={(e) => setForm({ ...form, pay_day: e.target.value ? parseInt(e.target.value, 10) : null })} />
+              <Label htmlFor="sp-day">{weekly ? "요일 (0=일)" : "납부일 (1~31, 31=말일)"}</Label>
+              <Input id="sp-day" type="number" min={weekly ? 0 : 1} max={weekly ? 6 : 31} value={form.pay_day ?? ""} onChange={(e) => setForm({ ...form, pay_day: e.target.value ? parseInt(e.target.value, 10) : null })} />
             </div>
           </div>
           <div className="grid grid-cols-2 gap-4">

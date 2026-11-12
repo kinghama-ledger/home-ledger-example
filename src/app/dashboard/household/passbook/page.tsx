@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowDownLeft, ArrowUpRight, ChevronLeft, ChevronRight, Landmark, RotateCcw, Wallet } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, ChevronLeft, ChevronRight, Landmark, RotateCcw, Search, Wallet } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -8,12 +8,14 @@ import { FailureNotice, LoadingNotice, Screen, FigureCard, FigureGrid } from "@/
 import { HhPageHeader } from "@/components/household/hh-page-header";
 import { HH_COL, HH_CELL, tableMinWidth, colStyles } from "@/components/household/hh-board";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { usePrivacyMode } from "@/components/privacy/privacy-mode";
 import { browserDb } from "@/lib/backend/browser";
 import { useHideInactiveAccounts, visibleAccounts as pickVisibleAccounts } from "@/lib/household/account-visibility";
 import { cn } from "@/lib/utils";
 import { formatManwon } from "@/lib/household/won-format";
 import { rangeOfMonth, shiftMonth, thisMonthKey } from "@/lib/household/month";
+import { matchesPassbookSearch, type PassbookSearchTarget } from "@/lib/household/passbook-search";
 import type { HhAccount, HhCategory, HhTransaction } from "@/lib/household/types";
 
 const LS_ACCOUNT = "hh_passbook_account";
@@ -101,7 +103,8 @@ function lastMonthRange() {
 function recent3Range() {
   return { start: rangeOfMonth(shiftMonth(thisMonthKey(), -2)).start, end: rangeOfMonth(thisMonthKey()).end };
 }
-const ALL_RANGE = { start: "1900-01-01", end: "2999-12-31" };
+type DateRange = { start: string; end: string };
+const ALL_RANGE: DateRange = { start: "1900-01-01", end: "2999-12-31" };
 
 // 통장 거래내역 열 폭 — 내용별 척도(설계 122). 실측 필요폭을 주석에 남긴다.
 const PASSBOOK_COLS = [
@@ -118,7 +121,7 @@ const PASSBOOK_COLS = [
 
 export default function HouseholdPassbookPage() {
   const supabase = useMemo(() => browserDb(), []);
-  const { mask } = usePrivacyMode();
+  const { mask, enabled: privacyOn } = usePrivacyMode();
 
   const [accounts, setAccounts] = useState<HhAccount[]>([]);
   // 비활성 계좌 숨기기(설계 89) — 선택 목록에만 적용, 현재 고른 계좌는 항상 남긴다.
@@ -130,6 +133,7 @@ export default function HouseholdPassbookPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [page, setPage] = useState(0);
+  const [keyword, setKeyword] = useState("");
   // 거래 조회 요청 번호 — 계좌 전환 시 이전 계좌의 늦은 응답을 버리는 데 쓴다(fetchTxns 주석 참고).
   const reqRef = useRef(0);
 
@@ -238,6 +242,23 @@ export default function HouseholdPassbookPage() {
     if (typeof window !== "undefined") localStorage.setItem(LS_ACCOUNT, id);
   };
 
+  // 거래 내역 설명(상대처/상대계좌/카테고리/메모).
+  // 가림 모드에서는 상대처·메모 원문을 가짜 상호로 바꾼다. 꺼져 있으면 원문 그대로다.
+  const maskText = useCallback((v: string | null) => (v ? mask("merchant", v) : v), [mask]);
+  const describe = useCallback(
+    (r: LedgerRow): string => {
+      const t = r.txn;
+      if (r.kind === "transfer_out" || r.kind === "transfer_in") {
+        const other = r.kind === "transfer_out" ? accountName(t.to_account_id) : accountName(t.from_account_id);
+        const arrow = `${r.kind === "transfer_out" ? "→" : "←"} ${other}`;
+        return conciseParts([arrow, maskText(t.memo), maskText(t.counterparty)]).join(" · ");
+      }
+      const parts = conciseParts([maskText(t.counterparty), categoryName(t.category_id), maskText(t.memo)]);
+      return parts.length ? parts.join(" · ") : KIND_LABEL[r.kind];
+    },
+    [accountName, categoryName, maskText],
+  );
+
   // 전 기간 누적 잔액을 계산한 뒤(오름차순), 표시는 최신순으로 뒤집는다.
   const allRows = useMemo<LedgerRow[]>(() => {
     if (!account) return [];
@@ -260,27 +281,62 @@ export default function HouseholdPassbookPage() {
     [allRows, range.start, range.end],
   );
 
-  const periodIn = windowRows.filter((r) => r.flow === "in").reduce((s, r) => s + r.delta, 0);
-  const periodOut = windowRows.filter((r) => r.flow === "out").reduce((s, r) => s - r.delta, 0);
-
-  const totalPages = Math.max(1, Math.ceil(windowRows.length / PAGE_SIZE));
-  const safePage = Math.min(page, totalPages - 1);
-  const pageRows = windowRows.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
-
-  // 거래 내역 설명(상대처/상대계좌/카테고리/메모).
-  const describe = useCallback(
-    (r: LedgerRow): string => {
-      const t = r.txn;
-      if (r.kind === "transfer_out" || r.kind === "transfer_in") {
-        const other = r.kind === "transfer_out" ? accountName(t.to_account_id) : accountName(t.from_account_id);
-        const arrow = `${r.kind === "transfer_out" ? "→" : "←"} ${other}`;
-        return conciseParts([arrow, t.memo, t.counterparty]).join(" · ");
-      }
-      const parts = conciseParts([t.counterparty, categoryName(t.category_id), t.memo]);
-      return parts.length ? parts.join(" · ") : KIND_LABEL[r.kind];
-    },
-    [accountName, categoryName],
+  // 검색 대상 글자는 거래마다 한 번만 만든다 — 내역 칸의 글자에 유형·상대처·메모 원문을 덧붙인다.
+  // 가림 중에는 화면에 보이는 글자로만 찾는다. 진짜 상호나 금액을 쳐 보고 몇 건인지로 실제 거래를 짐작할 수 없게 한다.
+  const searchTargets = useMemo(
+    () => new Map<string, PassbookSearchTarget>(allRows.map((r) => [
+      r.txn.id,
+      {
+        text: (privacyOn ? [describe(r), KIND_LABEL[r.kind]] : [describe(r), KIND_LABEL[r.kind], r.txn.counterparty, r.txn.memo]).filter(Boolean).join(" "),
+        amount: privacyOn ? Number.NaN : r.delta,
+        date: r.txn.txn_date,
+      },
+    ])),
+    [allRows, describe, privacyOn],
   );
+  const hasKeyword = keyword.trim().length > 0;
+  const isHit = useCallback(
+    (r: LedgerRow) => {
+      const target = searchTargets.get(r.txn.id);
+      return target ? matchesPassbookSearch(target, keyword) : false;
+    },
+    [searchTargets, keyword],
+  );
+  const searchedRows = useMemo(
+    () => (hasKeyword ? windowRows.filter(isHit) : windowRows),
+    [hasKeyword, isHit, windowRows],
+  );
+  // 고른 기간 밖에도 맞는 거래가 있으면 '전체 기간에서 보기'를 권한다.
+  const allPeriodMatchCount = useMemo(
+    () => (hasKeyword ? allRows.filter(isHit).length : 0),
+    [allRows, hasKeyword, isHit],
+  );
+
+  const periodIn = searchedRows.filter((r) => r.flow === "in").reduce((s, r) => s + r.delta, 0);
+  const periodOut = searchedRows.filter((r) => r.flow === "out").reduce((s, r) => s - r.delta, 0);
+
+  // 검색 중에는 카드가 검색 결과의 합계다 — 라벨이 '기간'으로 남으면 그 기간 전체 합계로 읽힌다.
+  const statPrefix = hasKeyword ? "검색" : "기간";
+
+  const totalPages = Math.max(1, Math.ceil(searchedRows.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages - 1);
+  const pageRows = searchedRows.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
+
+  // 기간이 바뀌면 1쪽으로 — 안 그러면 쪽 번호가 옛 값으로 남는다.
+  const changeRange = (next: DateRange | ((r: DateRange) => DateRange)) => {
+    setRange(next);
+    setPage(0);
+  };
+
+  const handleKeywordChange = (value: string) => {
+    setKeyword(value);
+    setPage(0);
+  };
+
+  const resetFilters = () => {
+    changeRange(thisMonthRange());
+    setKeyword("");
+  };
 
   return (
     <Screen>
@@ -291,18 +347,19 @@ export default function HouseholdPassbookPage() {
           <>
             계좌를 고르면 그 통장의 입금·출금·이체를 날짜순으로 보여주고, 각 거래 뒤의 잔액(거래후 잔액)을 함께 표시합니다.
             잔액은 기초잔액에서 전 기간 거래를 누적한 값입니다.
+            검색은 고른 계좌·기간 안에서 내역·금액·날짜로 찾으며, 검색 중에는 입금·출금·순증감 카드가 검색 결과의 합계(검색 입금·검색 출금)로 바뀝니다. 잔액은 검색과 무관한 실제 값입니다.
           </>
         }
       />
 
       <FigureGrid columns={4}>
         <FigureCard label="현재 잔액" value={won(currentBalance)} mobileValue={formatManwon(currentBalance)} tone={currentBalance < 0 ? "danger" : "default"} sensitive="amount" icon={Wallet} />
-        <FigureCard label="기간 입금" value={won(periodIn)} mobileValue={formatManwon(periodIn)} tone="positive" sensitive="amount" icon={ArrowDownLeft} />
-        <FigureCard label="기간 출금" value={won(periodOut)} mobileValue={formatManwon(periodOut)} tone="default" sensitive="amount" icon={ArrowUpRight} />
-        <FigureCard label="기간 순증감" value={won(periodIn - periodOut)} mobileValue={formatManwon(periodIn - periodOut)} tone={periodIn - periodOut < 0 ? "danger" : "positive"} sensitive="amount" />
+        <FigureCard label={`${statPrefix} 입금`} value={won(periodIn)} mobileValue={formatManwon(periodIn)} tone="positive" sensitive="amount" icon={ArrowDownLeft} />
+        <FigureCard label={`${statPrefix} 출금`} value={won(periodOut)} mobileValue={formatManwon(periodOut)} tone="default" sensitive="amount" icon={ArrowUpRight} />
+        <FigureCard label={`${statPrefix} 순증감`} value={won(periodIn - periodOut)} mobileValue={formatManwon(periodIn - periodOut)} tone={periodIn - periodOut < 0 ? "danger" : "positive"} sensitive="amount" />
       </FigureGrid>
 
-      {/* 조회바 — 계좌 선택 + 기간 */}
+      {/* 조회바 — 계좌 선택 + 기간 + 검색 */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-2xl border border-border/70 bg-card/85 px-4 py-3 text-sm shadow-sm">
         <div className="flex items-center gap-2">
           <Landmark className="h-4 w-4 text-muted-foreground" />
@@ -313,22 +370,28 @@ export default function HouseholdPassbookPage() {
             className="rounded-md border border-border/60 bg-background px-2 py-1 text-base font-medium md:text-sm"
           >
             {pickVisibleAccounts(accounts, hideInactiveAccounts, [accountId]).map((a) => (
-              <option key={a.id} value={a.id}>{a.name}{a.is_active ? "" : " (비활성)"}</option>
+              <option key={a.id} value={a.id}>{mask("owner_name", a.name)}{a.is_active ? "" : " (비활성)"}</option>
             ))}
           </select>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-muted-foreground">기간</span>
-          <input type="date" aria-label="시작일" value={range.start} max={range.end} onChange={(e) => setRange((r) => ({ ...r, start: e.target.value || r.start }))} className="rounded-md border border-border/60 bg-background px-2 py-1 text-base md:text-sm" />
+        {/* 좁은 화면에서 날짜칸 둘이 줄 폭을 다 먹어 '기간' 라벨이 두 줄로 눌린다 — 라벨은 안 줄이고 날짜칸이 남는 폭을 나눠 갖는다. */}
+        <div className="flex min-w-0 max-w-full items-center gap-2">
+          <span className="shrink-0 whitespace-nowrap text-muted-foreground">기간</span>
+          <input type="date" aria-label="시작일" value={range.start} max={range.end} onChange={(e) => changeRange((r) => ({ ...r, start: e.target.value || r.start }))} className="min-w-0 flex-1 rounded-md border border-border/60 bg-background px-2 py-1 text-base md:flex-initial md:text-sm" />
           <span className="text-muted-foreground">~</span>
-          <input type="date" aria-label="종료일" value={range.end} min={range.start} onChange={(e) => setRange((r) => ({ ...r, end: e.target.value || r.end }))} className="rounded-md border border-border/60 bg-background px-2 py-1 text-base md:text-sm" />
+          <input type="date" aria-label="종료일" value={range.end} min={range.start} onChange={(e) => changeRange((r) => ({ ...r, end: e.target.value || r.end }))} className="min-w-0 flex-1 rounded-md border border-border/60 bg-background px-2 py-1 text-base md:flex-initial md:text-sm" />
         </div>
-        <div className="flex items-center gap-1.5">
-          <Button variant="outline" size="sm" onClick={() => setRange(thisMonthRange())}>이번 달</Button>
-          <Button variant="outline" size="sm" onClick={() => setRange(lastMonthRange())}>지난 달</Button>
-          <Button variant="outline" size="sm" onClick={() => setRange(recent3Range())}>최근 3개월</Button>
-          <Button variant="outline" size="sm" onClick={() => setRange(ALL_RANGE)}>전체</Button>
-          <Button variant="ghost" size="sm" onClick={() => setRange(thisMonthRange())}><RotateCcw className="h-4 w-4" />초기화</Button>
+        <div className="relative min-w-[10rem] flex-1 md:max-w-xs">
+          <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input aria-label="내역 검색" value={keyword} onChange={(e) => handleKeywordChange(e.target.value)} placeholder="내역·금액·날짜로 검색" className="pl-10 text-base md:text-sm" />
+        </div>
+        {/* 아주 좁은 화면에서 '초기화'가 밖으로 밀려 잘리지 않게 다음 줄로 넘긴다. */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button variant="outline" size="sm" onClick={() => changeRange(thisMonthRange())}>이번 달</Button>
+          <Button variant="outline" size="sm" onClick={() => changeRange(lastMonthRange())}>지난 달</Button>
+          <Button variant="outline" size="sm" onClick={() => changeRange(recent3Range())}>최근 3개월</Button>
+          <Button variant="outline" size="sm" onClick={() => changeRange(ALL_RANGE)}>전체</Button>
+          <Button variant="ghost" size="sm" onClick={resetFilters}><RotateCcw className="h-4 w-4" />초기화</Button>
         </div>
       </div>
 
@@ -341,7 +404,16 @@ export default function HouseholdPassbookPage() {
       ) : (
         <div className="space-y-3">
           <div className="text-sm text-muted-foreground">
-            <span className="font-semibold text-foreground">{account ? mask("owner_name", account.name) : "-"}</span> · 기간 내 <span className="font-semibold text-foreground">{windowRows.length}</span>건
+            <span className="font-semibold text-foreground">{account ? mask("owner_name", account.name) : "-"}</span> · {hasKeyword ? (
+              <>
+                기간 내 검색 결과 <span className="font-semibold text-foreground">{searchedRows.length}</span>건
+                {allPeriodMatchCount > searchedRows.length ? (
+                  <> · 전체 기간 <span className="font-semibold text-foreground">{allPeriodMatchCount}</span>건{" "}
+                    <button type="button" className="text-primary underline-offset-2 hover:underline" onClick={() => changeRange(ALL_RANGE)}>전체 기간에서 보기</button>
+                  </>
+                ) : null}
+              </>
+            ) : <>기간 내 <span className="font-semibold text-foreground">{windowRows.length}</span>건</>}
           </div>
 
           {/* 데스크톱 표 */}
@@ -364,13 +436,13 @@ export default function HouseholdPassbookPage() {
               </thead>
               <tbody>
                 {pageRows.length === 0 ? (
-                  <tr><td colSpan={6} className="px-4 py-16 text-center text-sm text-muted-foreground">선택한 기간에 거래가 없습니다.</td></tr>
+                  <tr><td colSpan={6} className="px-4 py-16 text-center text-sm text-muted-foreground">{hasKeyword ? "검색 결과가 없습니다." : "선택한 기간에 거래가 없습니다."}</td></tr>
                 ) : (
                   pageRows.map((r) => (
                     <tr key={r.txn.id} className="border-b border-border/40">
                       <td className="whitespace-nowrap px-4 py-1 text-muted-foreground">{r.txn.txn_date}</td>
                       <td className="px-4 py-1"><span className={cn("inline-block rounded-full px-2 py-0.5 text-xs font-medium", KIND_BADGE[r.kind])}>{KIND_LABEL[r.kind]}</span></td>
-                      <td className={`${HH_CELL.wrapText} px-4 py-1`} title={describe(r)}>{mask("owner_name", describe(r))}</td>
+                      <td className={`${HH_CELL.wrapText} px-4 py-1`} title={mask("owner_name", describe(r))}>{mask("owner_name", describe(r))}</td>
                       <td className="whitespace-nowrap px-4 py-1 text-right tabular-nums text-blue-600 dark:text-blue-400">{r.flow === "in" ? mask("amount", won(r.delta)) : ""}</td>
                       <td className="whitespace-nowrap px-4 py-1 text-right tabular-nums text-foreground">{r.flow === "out" ? mask("amount", won(-r.delta)) : ""}</td>
                       <td className={cn("whitespace-nowrap px-4 py-1 text-right tabular-nums font-semibold", r.balanceAfter < 0 && "text-rose-600 dark:text-rose-400")}>{mask("amount", won(r.balanceAfter))}</td>
@@ -384,7 +456,7 @@ export default function HouseholdPassbookPage() {
           {/* 모바일 카드 */}
           <div className="space-y-2 md:hidden">
             {pageRows.length === 0 ? (
-              <div className="rounded-2xl border border-border/70 bg-card/85 px-4 py-16 text-center text-sm text-muted-foreground shadow-sm">선택한 기간에 거래가 없습니다.</div>
+              <div className="rounded-2xl border border-border/70 bg-card/85 px-4 py-16 text-center text-sm text-muted-foreground shadow-sm">{hasKeyword ? "검색 결과가 없습니다." : "선택한 기간에 거래가 없습니다."}</div>
             ) : (
               pageRows.map((r) => (
                 <div key={r.txn.id} className="rounded-2xl border border-border/70 bg-card/85 p-4 shadow-sm">
@@ -407,11 +479,11 @@ export default function HouseholdPassbookPage() {
           {/* 페이지네이션 */}
           {totalPages > 1 ? (
             <div className="flex items-center justify-center gap-3 text-sm">
-              <button type="button" disabled={safePage === 0} onClick={() => setPage((p) => Math.max(0, p - 1))} className="inline-flex h-9 items-center gap-1 rounded-lg border border-border/70 px-3 text-muted-foreground hover:bg-muted/50 disabled:opacity-40">
+              <button type="button" disabled={safePage === 0} onClick={() => setPage(Math.max(0, safePage - 1))} className="inline-flex h-9 items-center gap-1 rounded-lg border border-border/70 px-3 text-muted-foreground hover:bg-muted/50 disabled:opacity-40">
                 <ChevronLeft className="h-4 w-4" /> 이전
               </button>
               <span className="text-muted-foreground">{safePage + 1} / {totalPages}</span>
-              <button type="button" disabled={safePage >= totalPages - 1} onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))} className="inline-flex h-9 items-center gap-1 rounded-lg border border-border/70 px-3 text-muted-foreground hover:bg-muted/50 disabled:opacity-40">
+              <button type="button" disabled={safePage >= totalPages - 1} onClick={() => setPage(Math.min(totalPages - 1, safePage + 1))} className="inline-flex h-9 items-center gap-1 rounded-lg border border-border/70 px-3 text-muted-foreground hover:bg-muted/50 disabled:opacity-40">
                 다음 <ChevronRight className="h-4 w-4" />
               </button>
             </div>

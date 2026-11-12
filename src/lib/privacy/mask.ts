@@ -7,7 +7,8 @@ export type MaskKind =
   | "expense_amount"
   | "merchant"
   | "owner_name"
-  | "name";
+  | "name"
+  | "account_no";
 
 export type MaskInput = string | number | null | undefined;
 
@@ -101,6 +102,13 @@ function fakeOwnerName(text: string): string {
   return text.replace(/\(([^()]+)\)/g, (_match, inner: string) => `(${fakePersonName(inner.trim())})`);
 }
 
+// ── 가짜 계좌·카드 번호 ────────────────────────────────────────────────────
+// 숫자만 다른 숫자로 바꾼다. 자릿수와 구분 기호(-, 공백, *)는 그대로라 칸 폭이 변하지 않는다.
+function fakeAccountNo(text: string): string {
+  const next = sequenceFrom(seedOf(`account_no/${text}`));
+  return text.replace(/\d/g, () => String(Math.floor(next() * 10)));
+}
+
 // ── 가짜 상호 ──────────────────────────────────────────────────────────────
 // 앞말과 업종을 따로 골라 붙인다. 실제 상호와 겹치지 않게 흔한 낱말만 썼다.
 const SHOP_PREFIXES = [
@@ -137,7 +145,37 @@ export function mask(kind: MaskKind, value: MaskInput, enabled: boolean): string
       return fakeOwnerName(text);
     case "name":
       return fakePersonName(text);
+    case "account_no":
+      return fakeAccountNo(text);
     default:
       return text;
   }
+}
+
+function escapeForPattern(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * 글 안 어디에 있든(괄호 안·하이픈 뒤·단독) 등록된 사람 이름을 가짜 이름으로 바꾼다.
+ * 대출명·정기지출 제목처럼 사용자가 지은 이름에 쓴다 — 예) "주택담보대출-김하늘" → "주택담보대출-(가짜 이름)".
+ * 같은 이름은 `mask("name", …)` 과 같은 가짜 이름이 된다. 긴 이름부터 맞춰 보고, 한 번 바꾼 자리는 다시 바꾸지 않는다.
+ * 등록되지 않은 이름은 알 길이 없어 그대로 둔다(괄호 안 이름은 `mask("owner_name", …)` 이 맡는다).
+ */
+export function maskNamesIn(
+  value: MaskInput,
+  names: readonly (string | null | undefined)[],
+  enabled: boolean
+): string {
+  if (value === null || value === undefined) return "";
+  const text = String(value);
+  if (!enabled || text === "") return text;
+
+  const known = [...new Set(names.map((n) => n?.trim() ?? "").filter((n) => n !== ""))].sort(
+    (a, b) => b.length - a.length
+  );
+  if (known.length === 0) return text;
+
+  const pattern = new RegExp(known.map(escapeForPattern).join("|"), "g");
+  return text.replace(pattern, (found) => fakePersonName(found));
 }

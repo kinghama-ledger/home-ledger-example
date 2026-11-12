@@ -30,7 +30,7 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
 
 export default function HouseholdIncomeDetailPage() {
   const supabase = useMemo(() => browserDb(), []);
-  const { mask } = usePrivacyMode();
+  const { mask, enabled: privacyOn } = usePrivacyMode();
   const params = useParams();
   const router = useRouter();
   const id = params.id as string;
@@ -62,6 +62,11 @@ export default function HouseholdIncomeDetailPage() {
 
   const handleDelete = async () => {
     if (!row || deleting) return;
+    // 가림 모드에서는 삭제하지 않는다 — 확인창에 실제 값이 그대로 나온다.
+    if (privacyOn) {
+      toast.info("마스킹 모드에서는 삭제할 수 없습니다");
+      return;
+    }
     if (!confirm(`${row.txn_date} · ${row.amount.toLocaleString("ko-KR")}원 수입을 삭제하시겠습니까?`)) return;
     setDeleting(true);
     const { error: err } = await supabase.from("hh_transaction").delete().eq("id", id);
@@ -124,7 +129,7 @@ export default function HouseholdIncomeDetailPage() {
         <Field label="금액" value={<span className="font-semibold tabular-nums text-blue-600 dark:text-blue-400">{mask("income_amount", `${row.amount.toLocaleString("ko-KR")}원`)}</span>} />
         <Field label="입금처" value={row.counterparty ? mask("merchant", row.counterparty) : "-"} />
         <Field label="입금계좌" value={row.hh_account?.name ? mask("owner_name", row.hh_account.name) : "-"} />
-        <Field label="메모" value={row.memo ?? "-"} />
+        <Field label="메모" value={row.memo ? mask("merchant", row.memo) : "-"} />
       </Panel>
     </Screen>
   );

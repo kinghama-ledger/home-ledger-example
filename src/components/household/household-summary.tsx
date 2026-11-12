@@ -21,12 +21,16 @@ import {
   loanCategoryId,
   loanIncomeCategoryId,
   monthFlowTotals,
+  effectiveLoanPayments,
   monthlyCashflow,
   monthOverMonthSpike,
   variableAmountCategoryIds,
   type ActualOutflow,
 } from "@/lib/household/calc";
 import { cashflowSnapshot } from "@/lib/household/cashflow-snapshot";
+import { buildVariableSpendInput, type VariableSpendSample } from "@/lib/household/variable-spend";
+import { fetchVariableSpendSamples } from "@/lib/household/variable-spend-fetch";
+import { seoulToday } from "@/lib/household/sms";
 import { cardBillCategoryId } from "@/lib/household/category-names";
 import { fetchTxnsPaged } from "@/lib/household/fetch-txns";
 import { shiftMonth, thisMonthKey } from "@/lib/household/month";
@@ -90,6 +94,11 @@ export function HouseholdSummary() {
   // 현금흐름 예측 요약(설계 65 2차) — 여유선·기간은 현금흐름 화면과 같은 localStorage 공유.
   const [bufferLine, setBufferLine] = useState(1_000_000);
   const [horizon, setHorizon] = useState(3);
+  // 변동 지출(생활비) 보정 — 현금흐름 화면과 같은 표본·같은 켜기/조정값(localStorage 공유). 빼면 '이번 달 잔액'이
+  // 두 화면에서 이번 달 남은 생활비만큼 갈린다. (설계 173·79)
+  const [vsSamples, setVsSamples] = useState<VariableSpendSample[]>([]);
+  const [vsEnabled, setVsEnabled] = useState(true);
+  const [vsOverride, setVsOverride] = useState<number | null>(null);
 
   const month = thisMonthKey();
 
@@ -153,6 +162,13 @@ export function HouseholdSummary() {
     setTotalCash(cash);
     setAccountIds(((accRes.data ?? []) as { id: string }[]).map((a) => a.id));
     setLoading(false);
+
+    // 변동 지출 표본 — 현금흐름 화면과 같은 조회. 화면을 먼저 그린 뒤 채운다(설계 173).
+    void fetchVariableSpendSamples(supabase, month, {
+      scheduled: (spRes.data ?? []) as HhScheduledPayment[],
+      methods: (pmRes.data ?? []) as HhPaymentMethod[],
+      accountIds: ((accRes.data ?? []) as { id: string }[]).map((a) => a.id),
+    }).then((r) => setVsSamples(r.samples));
   }, [supabase, month]);
 
   useEffect(() => {
@@ -168,9 +184,14 @@ export function HouseholdSummary() {
     const bRaw = localStorage.getItem("hh_cash_buffer_line");
     const b = bRaw === null ? NaN : Number(bRaw);
     const h = Number(localStorage.getItem("hh_cash_forecast_horizon"));
+    const vsOn = localStorage.getItem("hh_cash_varspend_on");
+    const vsOv = localStorage.getItem("hh_cash_varspend_override");
+    const vsOvNum = vsOv != null && vsOv !== "" && Number.isFinite(Number(vsOv)) ? Number(vsOv) : null;
     /* eslint-disable react-hooks/set-state-in-effect */
     if (Number.isFinite(b) && b >= 0) setBufferLine(b);
     if (h === 3 || h === 6 || h === 12) setHorizon(h);
+    if (vsOn != null) setVsEnabled(vsOn === "1");
+    if (vsOvNum != null) setVsOverride(vsOvNum);
     /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
@@ -196,7 +217,13 @@ export function HouseholdSummary() {
   const spending = flow.expense;
 
   // 이번 달 현금흐름(고정비·대출·할부) + 신용카드 사용액
-  const cf = useMemo(() => monthlyCashflow(month, { scheduled, loans, installments }), [month, scheduled, loans, installments]);
+  // 대출은 직전 실제 상환액으로(설계 219) — 현금흐름 당월 표와 같은 기준이라야 두 화면이 갈리지 않는다(설계 79).
+  //   ★txns 는 연초부터라 현금흐름의 최근 3개월 풀(당월−2 ~)과 범위가 다르다 — 같은 창으로 잘라 넘긴다.
+  const cf = useMemo(() => {
+    const win3Start = `${shiftMonth(month, -2)}-01`;
+    const pool = txns.filter((t) => t.txn_date >= win3Start);
+    return monthlyCashflow(month, { scheduled, loans: effectiveLoanPayments(loans, pool, shiftMonth(month, -1), scheduled), installments });
+  }, [month, scheduled, loans, installments, txns]);
   const cardBill = useMemo(() => {
     const creditIds = new Set(methods.filter((m) => m.kind === "credit").map((m) => m.id));
     return txns
@@ -232,12 +259,22 @@ export function HouseholdSummary() {
   const bStatus = useMemo(() => budgetStatus(month, txns, installments, categories, budgets), [month, txns, installments, categories, budgets]);
   const spikes = useMemo(() => monthOverMonthSpike(month, shiftMonth(month, -1), txns, installments, categories), [month, txns, installments, categories]);
 
+  // today — 현금흐름 화면과 같은 자(설계 212: 예정일 전 항목은 상호까지 맞는 거래만 '출금됨').
+  // 렌더마다 읽고 deps 에 넣는다 — useMemo 안에서 읽으면 자정을 넘겨도 옛 날짜로 남는다.
+  const today = seoulToday();
+  const variableSpend = useMemo(
+    () => buildVariableSpendInput(vsSamples, month, today.slice(0, 7) === month ? Number(today.slice(8, 10)) : 1, vsEnabled, vsOverride).input,
+    [vsSamples, month, today, vsEnabled, vsOverride],
+  );
+
   // ★공유 계산(설계 79) — 출금 예정·이번 달 잔액·여러 달 예측을 현금흐름 화면과 같은 함수로.
   // 오버라이드(날짜복귀·출금금액 직접입력·직접 제외)까지 반영되어 두 화면 숫자가 항상 같다.
   const snap = useMemo(() => {
     const win3Start = `${shiftMonth(month, -2)}-01`;
     const recentOutflows: ActualOutflow[] = txns
-      .filter((t) => (t.type === "expense" || t.type === "payment" || t.type === "transfer") && t.txn_date >= win3Start)
+      // ★상한도 현금흐름 화면(당월 말까지 조회)과 같게 — 홈 txns 는 연말까지라 미리 등록한 다음 달 거래가
+      //   최근 실적(paidRecently)에 섞이면 두 화면의 예정 항목이 갈린다(설계 79·229).
+      .filter((t) => (t.type === "expense" || t.type === "payment" || t.type === "transfer") && t.txn_date >= win3Start && t.txn_date < `${shiftMonth(month, 1)}-01`)
       // ★계좌 컬럼까지 넘긴다 — 없으면 내부 이체를 못 걸러 현금흐름 화면과 숫자가 갈린다(설계 131·79).
       .map((t) => ({
         amount: t.amount,
@@ -249,12 +286,14 @@ export function HouseholdSummary() {
         from_account_id: t.from_account_id,
         to_account_id: t.to_account_id,
         payment_method_id: t.payment_method_id,
+        // 대출 항목이 자기 상환을 먼저 받는 0패스(설계 216) — 빼면 홈·현금흐름 매칭이 갈린다(설계 79).
+        loan_id: t.loan_id,
         // 변동금액(통신비) 매칭(설계 229) — 빼면 홈·현금흐름 매칭이 갈린다(설계 79).
         category_id: t.category_id,
       }));
     const variableAmountCats = variableAmountCategoryIds(categories);
-    return cashflowSnapshot(month, { scheduled, loans, installments, txns, methods, overrides, nextOverrides, recentOutflows, accountIds, totalCash, horizon, variableAmountCategoryIds: variableAmountCats });
-  }, [month, txns, scheduled, loans, installments, methods, overrides, nextOverrides, accountIds, totalCash, horizon, categories]);
+    return cashflowSnapshot(month, { scheduled, loans, installments, txns, methods, overrides, nextOverrides, recentOutflows, accountIds, totalCash, horizon, variableSpend, today, variableAmountCategoryIds: variableAmountCats });
+  }, [month, txns, scheduled, loans, installments, methods, overrides, nextOverrides, accountIds, totalCash, horizon, variableSpend, today, categories]);
 
   // 현금흐름 예측 요약(설계 65 2차) — 정기수입이 없으면 예측 무의미라 표시 안 함.
   const forecastRisk = useMemo(() => {
@@ -270,8 +309,8 @@ export function HouseholdSummary() {
   const dCash = maskNum(totalCash, "income_amount");
   const dPendingIn = maskNum(snap.pendingIn, "income_amount");
   const dPendingOut = maskNum(snap.pendingOutAll, "expense_amount");
-  // ⑥ 이번 달 잔액 = (마스킹된) 계좌 잔액 + 입금 예정 − 출금 예정 → 카드 간 산식 일관 유지(현금흐름과 동일 산식, 설계 79)
-  const dMonthEnd = dCash + dPendingIn - dPendingOut;
+  // ⑥ 이번 달 잔액 = (마스킹된) 계좌 잔액 + 입금 예정 − 출금 예정 − 남은 생활비 → 현금흐름 monthEndCash 와 같은 산식(설계 79·173)
+  const dMonthEnd = dCash + dPendingIn - dPendingOut - maskNum(snap.variableSpendApplied.firstMonth, "expense_amount");
 
   // 색 규율(설계 80): 일반 지출·출금 카드는 중립(default). 색은 수입(파랑)과 진짜 경고(빨강)에만.
   const cards: { label: string; value: number; icon: typeof Wallet; tone: "positive" | "danger" | "warning" | "info" | "default"; href: string }[] = [

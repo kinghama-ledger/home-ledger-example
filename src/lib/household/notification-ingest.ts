@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { serviceDb } from "@/lib/backend/service";
-import { enrichParsed, hasSameDayAmountSibling, hasSameTimeSibling, insertInboxWithSameTimeRetry, insertTraceUnknown, isCrossSourceDuplicate, isDuplicateFamilyTransfer, sweepAfterInsertIfPending } from "@/lib/household/sms-ingest";
-import { cashbackComboPayAmount, hashIngestToken, ignoreTraceGuessedType, skipDisposition } from "@/lib/household/sms";
+import { enrichParsed, hasSameDayAmountSibling, hasSameTimeSibling, insertInboxWithSameTimeRetry, insertTraceUnknown, isCrossSourceDuplicate, isDuplicateFamilyTransfer, relabelOnnuriLinkedCardPayment, sweepAfterInsertIfPending } from "@/lib/household/sms-ingest";
+import { cashbackComboPayAmount, hashIngestToken, ignoreTraceGuessedType, notificationDedupKey, skipDisposition } from "@/lib/household/sms";
 
 function bearerToken(value: string | null): string | null {
   if (!value) return null;
@@ -77,7 +77,7 @@ function minuteKey(receivedAt: unknown): string {
  * 동작: 원본 envelope을 raw_meta에 보존 + best-effort 파싱(가맹점·금액·계좌·카테고리)
  *       → 광고·정보성 알림(주식 시세·할인 등)은 SMS와 동일 필터로 skip, 거래만
  *       hh_transaction_inbox(source='notification', pending)에 적재. (설계 docs/household/50)
- * 중복: title + text + 분단위시각(receivedAt) 기준 dedup_hash.
+ * 중복: title + text + 분단위시각(receivedAt) 기준 dedup_hash(평문이 아니라 sha256 으로 저장).
  */
 export async function handleNotificationIngest(request: NextRequest) {
   try {
@@ -176,7 +176,7 @@ export async function handleNotificationIngest(request: NextRequest) {
     }
 
     // 중복 방지: title + text + 분단위시각. (사용자 지정) — 같은 알림 재전송 억제용.
-    const dedupHash = [title ?? "", text ?? "", minuteKey(receivedAt)].join("|");
+    const dedupHash = notificationDedupKey(title ?? "", text ?? "", minuteKey(receivedAt));
 
     // 크로스소스 이중수집(SMS 등 다른 소스가 같은 금액·날짜를 이미 수집)이면 duplicate로. (설계 docs/household/63)
     // 이체는 끝점 계좌로 '서로 다른 이체'를 구분해 오판 방지(보강 2026-07-19).
@@ -187,7 +187,10 @@ export async function handleNotificationIngest(request: NextRequest) {
       toAccountId: fields.guessed_to_account_id,
       merchant: fields.guessed_merchant,
       accountId: fields.guessed_account_id,
+      reportedBalance: fields.reported_balance,
       reportedBalanceAccountId: fields.reported_balance_account_id,
+      source: "notification",
+      sourceAdapter: app ?? pkg,
     };
     // 같은 날짜·시각·금액 수집 건이 이미 있으면 이번 행은 휴지통(ignored)으로. (설계 163 — SMS 핸들러와 동일)
     const sameTimeDup = await hasSameTimeSibling(supabase, owner, parsed.kind, fields.guessed_date, fields.guessed_time, parsed.amount);
@@ -239,6 +242,11 @@ export async function handleNotificationIngest(request: NextRequest) {
       parsed.amount,
       txEndpoints
     );
+
+    // 카드 승인 알림이 온누리 결제 문자보다 늦게 왔으면 이 행을 온누리 계좌로 바꾼다. (설계 224)
+    if (insertedId && !sameTimeDup && !trashedByRace && parsed.kind === "approve") {
+      await relabelOnnuriLinkedCardPayment(supabase, owner, fields.guessed_date, parsed.amount);
+    }
 
     await supabase.from("hh_ingest_token").update({ last_used_at: new Date().toISOString() }).eq("id", tokenRow.id);
 

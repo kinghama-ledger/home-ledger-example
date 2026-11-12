@@ -18,7 +18,7 @@ import type { HhInstallment } from "@/lib/household/types";
 
 export default function HouseholdInstallmentDetailPage() {
   const supabase = useMemo(() => browserDb(), []);
-  const { mask } = usePrivacyMode();
+  const { mask, enabled: privacyOn } = usePrivacyMode();
   const params = useParams();
   const router = useRouter();
   const id = params.id as string;
@@ -55,6 +55,11 @@ export default function HouseholdInstallmentDetailPage() {
 
   const handleDelete = async () => {
     if (!row || deleting) return;
+    // 가림 모드에서는 삭제하지 않는다 — 확인창에 실제 값이 그대로 나온다.
+    if (privacyOn) {
+      toast.info("마스킹 모드에서는 삭제할 수 없습니다");
+      return;
+    }
     if (!confirm(`'${row.title ?? "할부"}' 할부를 삭제하시겠습니까?`)) return;
     setDeleting(true);
     const { error: err } = await supabase.from("hh_installment").delete().eq("id", id);
@@ -80,7 +85,7 @@ export default function HouseholdInstallmentDetailPage() {
   return (
     <Screen>
       <HhPageHeader
-        title={`${row.title ?? "할부"} · ${mask("expense_amount",`${row.total_amount.toLocaleString("ko-KR")}원`)}`}
+        title={`${row.title ? mask("merchant", row.title) : "할부"} · ${mask("expense_amount",`${row.total_amount.toLocaleString("ko-KR")}원`)}`}
         breadcrumbs={[{ label: "가계부" }, { label: "지출", href: "/dashboard/household/expenses" }, { label: "할부" }]}
         actions={
           <>
@@ -94,7 +99,7 @@ export default function HouseholdInstallmentDetailPage() {
         <HhField label="시작일" value={row.start_date} />
         <HhField label="카드" value={mask("owner_name", names.method)} />
         <HhField label="카테고리" value={names.category} />
-        <HhField label="내용" value={row.title ?? "-"} />
+        <HhField label="내용" value={row.title ? mask("merchant", row.title) : "-"} />
         <HhField label="총금액" value={<span className="tabular-nums">{mask("expense_amount",`${row.total_amount.toLocaleString("ko-KR")}원`)}</span>} />
         <HhField label="월 금액" value={<span className="tabular-nums">{mask("expense_amount",`${p.monthly.toLocaleString("ko-KR")}원`)}</span>} />
         <HhField label="진행" value={`${shownCurrent} / ${row.total_count}회`} />

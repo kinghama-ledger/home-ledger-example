@@ -12,7 +12,7 @@ import {
 } from "@/components/screen/blocks";
 import { HhPageHeader } from "@/components/household/hh-page-header";
 import { HhTxnTabs } from "@/components/household/hh-txn-tabs";
-import { HhBoard, HH_COL } from "@/components/household/hh-board";
+import { HhBoard, HH_CELL, HH_COL } from "@/components/household/hh-board";
 import { IncomeEditDialog } from "@/components/household/income-edit-dialog";
 import { HhSearchBar, type HhDateRange, type HhAdvancedFilter, EMPTY_ADVANCED_FILTER, passesAdvancedFilter } from "@/components/household/hh-search-bar";
 import { Badge } from "@/components/ui/badge";
@@ -180,10 +180,10 @@ export default function HouseholdIncomePage() {
           // 항목: 배지(px-2+테두리)가 short(88, 안쪽 58)를 1.7px 넘쳤다. 같은 배지 열인 지출 '카테고리'도
           // standard 다 — 둘을 맞춘다(설계 122: 필요폭 이상인 가장 작은 슬롯).
           { key: "category", header: "항목", align: "left", width: HH_COL.standard, mobile: "meta", cell: (r) => <Badge variant="secondary">{categoryName(r.category_id)}</Badge> },
-          // 입금처 — '카카오T주차_카카오페이 (토스뱅크 체크카드)'(214)가 xxwide(208)에서 꺾였고
-          // x3wide(240)로도 4px 모자랐다(안쪽 210). x4wide(272)라야 한 줄에 들어간다(실측 2026-08-09).
-          // 표 합계 680 → 744 로 여유가 크다(상한 1200).
-          { key: "counterparty", header: "입금처", align: "left", width: HH_COL.x4wide, mobile: "title", cell: (r) => <span className="font-medium text-foreground">{r.counterparty ? mask("merchant", r.counterparty) : "-"}</span> },
+          // 입금처 — 가변 글 열의 기준폭 xwide(160, 안쪽 128 = 한글 12자쯤). 넘는 이름은 자르지 않고 줄을 바꾼다.
+          // 예전엔 값 하나(214px 짜리 이름)에 맞춰 x4wide(272)였는데, 회사·은행 이름처럼 짧은 값만 있으면
+          // 이 열에만 190px 이 비어 열 간격 검사(A')에 걸렸다(실측 2026-11-12, 가상 자료). 표 합계 744 → 632.
+          { key: "counterparty", header: "입금처", align: "left", width: HH_COL.xwide, mobile: "title", cell: (r) => <span className={`${HH_CELL.wrapText} font-medium text-foreground`}>{r.counterparty ? mask("merchant", r.counterparty) : "-"}</span> },
           { key: "account", header: "입금계좌", align: "left", width: HH_COL.wide, mobile: "meta", cell: (r) => <span className="text-muted-foreground">{mask("owner_name", accountName(r.account_id))}</span> },
           // 금액: short(88)에서 8자리(`15,000,000원` 실측 94)가 잘렸다 — 8자리 금액의 수입 행에서
           // 처음 드러났다(1440·768px 양쪽). 척도상 필요폭 이상인 가장 작은 슬롯 = standard(112). (설계 122·123)

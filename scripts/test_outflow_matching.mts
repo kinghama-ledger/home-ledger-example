@@ -26,7 +26,7 @@ const TOL = { earlyDayTolerance: 5 };
 
 console.log("\n[0] 스냅샷·전월 열 공용 매칭 item — 대출만 계좌 게이트를 면제한다(설계 185 후속)");
 {
-  const base = { key: "item:1", amount: 100_000, label: "예정 지출", day: 10, accountId: "acc-current" };
+  const base = { key: "item:1", sourceId: "src-1", amount: 100_000, label: "예정 지출", day: 10, accountId: "acc-current" };
   eq("★대출은 현재 계좌를 매칭 게이트에 넘기지 않는다", toOutflowMatchItem({ ...base, sourceKind: "loan" }).accountId, null);
   eq("고정비는 계좌 게이트를 유지한다", toOutflowMatchItem({ ...base, sourceKind: "fixed" }).accountId, "acc-current");
   eq("할부도 계좌 게이트를 유지한다", toOutflowMatchItem({ ...base, sourceKind: "installment" }).accountId, "acc-current");
@@ -34,6 +34,9 @@ console.log("\n[0] 스냅샷·전월 열 공용 매칭 item — 대출만 계좌
   //   계좌일치 우선패스가 대출 몫을 가로채지 않게 하는 근거.
   eq("★대출은 accountBlind 표식을 단다", toOutflowMatchItem({ ...base, sourceKind: "loan" }).accountBlind, true);
   eq("고정비는 accountBlind 가 아니다", toOutflowMatchItem({ ...base, sourceKind: "fixed" }).accountBlind, false);
+  // 설계 216: 대출 항목만 원천 id 를 loanId 로 싣는다 — 0패스가 장부 loan_id 와 대조한다.
+  eq("★대출은 원천 id 를 loanId 로 싣는다", toOutflowMatchItem({ ...base, sourceKind: "loan" }).loanId, "src-1");
+  eq("고정비는 loanId 가 없다", toOutflowMatchItem({ ...base, sourceKind: "fixed" }).loanId, null);
 }
 
 console.log("\n[0-1] 전월 열 종단 — 현재 대출계좌와 다른 과거 계좌의 상환도 잡는다(설계 185 후속)");
@@ -43,7 +46,7 @@ console.log("\n[0-1] 전월 열 종단 — 현재 대출계좌와 다른 과거 
     categoryId: null, day: 10, naturalDay: 10, dayOverridden: false, amount: 100_000,
     accountId: "acc-current", paymentMethodId: null, cardCharge: false,
     baseCardCharge: false, baseAccountId: "acc-current", methodOverridden: false, released: false,
-    paidOverride: null, paidAmount: null, reason: null,
+    paidOverride: null, paidAmount: null, reason: null, amountOverridden: false, remainingAmount: 100_000, paidPartial: false,
   } as const;
   const oldAccountPayment = {
     amount: 100_000, counterparty: "합성저축은행", txn_date: "2026-07-10", type: "payment" as const,
@@ -430,7 +433,7 @@ console.log("\n[229] 변동금액 카테고리(통신비) — 같은 카테고�
 
   // 공용 헬퍼: 변동금액 카테고리 집합에 든 항목만 표식을 단다. 대출은 달지 않는다.
   const flex = new Set([CAT_TEL]);
-  const base = { key: "k", amount: 55_000, label: "통신비", day: 20, accountId: "acc-kb" };
+  const base = { key: "k", sourceId: "k", amount: 55_000, label: "통신비", day: 20, accountId: "acc-kb" };
   eq("헬퍼: 통신비 고정비는 표식을 단다", toOutflowMatchItem({ ...base, sourceKind: "fixed", categoryId: CAT_TEL }, flex).flexCategoryId, CAT_TEL);
   eq("헬퍼: 다른 카테고리는 달지 않는다", toOutflowMatchItem({ ...base, sourceKind: "fixed", categoryId: CAT_FOOD }, flex).flexCategoryId, null);
   eq("헬퍼: 집합을 안 주면 종전 동작", toOutflowMatchItem({ ...base, sourceKind: "fixed", categoryId: CAT_TEL }).flexCategoryId, null);
@@ -438,6 +441,485 @@ console.log("\n[229] 변동금액 카테고리(통신비) — 같은 카테고�
 
   const { variableAmountCategoryIds } = await import("../src/lib/household/calc");
   eq("카테고리 이름 '통신비'만 고른다", variableAmountCategoryIds([{ id: "a", name: "통신비" }, { id: "b", name: "식비" }]).join(","), "a");
+}
+
+console.log("\n[12] 예정일 전 항목은 상호까지 맞는 거래만 '출금됨'(설계 212) (값은 가상)");
+{
+  // 24일 예정 용돈 70,000 에, 나흘 앞서 나간 같은 금액의 주유비가 붙으면 안 된다.
+  const allowance = { key: "fixed:yd", amount: 70_000, label: "용돈-이바다", day: 24 };
+  const fuel = [{ amount: 70_000, counterparty: "한빛주유소", txn_date: "2026-06-20", type: "expense" }];
+  eq("★예정일(24) 전, 금액만 같은 주유비 = 안 붙는다", matchOutflowActuals([allowance], fuel, { ...TOL, todayDay: 20 }).has("fixed:yd"), false);
+  eq("  todayDay 를 안 주면 종전대로 붙는다(과거 달 호환)", matchOutflowActuals([allowance], fuel, TOL).has("fixed:yd"), true);
+  eq("  예정일 당일부터는 금액만으로도 붙는다", matchOutflowActuals([allowance], fuel, { ...TOL, todayDay: 24 }).has("fixed:yd"), true);
+  const early = [{ amount: 70_000, counterparty: "이바다", txn_date: "2026-06-20", type: "expense" }];
+  eq("  예정일 전이라도 상호까지 맞으면(선납) 붙는다", matchOutflowActuals([allowance], early, { ...TOL, todayDay: 20 }).has("fixed:yd"), true);
+
+  // 동점이면 예정일에 가까운 거래 — 예정일이 지나는 순간 며칠 앞선 남의 동일금액 거래가 먼저 붙지 않게.
+  const save = { key: "fixed:sv", amount: 150_000, label: "적금-이바다(청약)", day: 27 };
+  const two = [
+    { amount: 150_000, counterparty: "0000111122223", txn_date: "2026-06-22", type: "expense" },
+    { amount: 150_000, counterparty: "0000111122224", txn_date: "2026-06-27", type: "expense" },
+  ];
+  eq("★동점이면 예정일(27)에 가까운 6/27 거래", matchOutflowActuals([save], two, { ...TOL, todayDay: 28 }).get("fixed:sv")?.txn_date, "2026-06-27");
+
+  const { todayDayIn } = await import("../src/lib/household/cashflow-snapshot");
+  eq("todayDayIn: 이번 달이면 오늘 일자", todayDayIn("2026-06", "2026-06-20"), 20);
+  eq("todayDayIn: 다른 달이면 걸지 않는다", todayDayIn("2026-05", "2026-06-20"), undefined);
+  eq("todayDayIn: today 미지정이면 걸지 않는다", todayDayIn("2026-06"), undefined);
+  eq("★todayDayIn: 30일 달 말일이면 31(청구일 31일 항목도 도래)", todayDayIn("2026-06", "2026-06-30"), 31);
+  eq("  todayDayIn: 2월 말일(28)도 31", todayDayIn("2026-02", "2026-02-28"), 31);
+  eq("  todayDayIn: 말일 전날은 그대로", todayDayIn("2026-06", "2026-06-29"), 29);
+  eq("  day 31 항목 + 30일 말일 → 금액만으로도 붙는다", matchOutflowActuals([{ ...allowance, day: 31 }], fuel.map((t) => ({ ...t, txn_date: "2026-06-30" })), { ...TOL, todayDay: todayDayIn("2026-06", "2026-06-30") }).has("fixed:yd"), true);
+
+  // 종단 — cashflowSnapshot 이 today 를 매칭까지 넘기는지(배선을 지우면 빨갛게 된다).
+  const { cashflowSnapshot } = await import("../src/lib/household/cashflow-snapshot");
+  const sp = {
+    id: "sp-yd", owner_auth_uid: "o", title: "용돈-이바다", direction: "out", amount: 70_000, frequency: "monthly", pay_day: 24,
+    account_id: "acc-w", category_id: "cat-1", is_active: true, start_date: null, end_date: null,
+    person_id: null, memo: null, sort_order: 0, created_at: "", updated_at: "",
+  };
+  const base = {
+    scheduled: [sp], loans: [], installments: [], txns: [], methods: [], overrides: [], nextOverrides: [],
+    recentOutflows: [
+      { amount: 70_000, counterparty: "한빛주유소", txn_date: "2026-06-20", type: "expense", account_id: "acc-w" },
+      { amount: 70_000, counterparty: "이바다", txn_date: "2026-05-24", type: "expense", account_id: "acc-w" },
+    ],
+    totalCash: 1_000_000, horizon: 1, accountIds: ["acc-w"],
+  };
+  const paidOf = (today?: string) =>
+    cashflowSnapshot("2026-06", { ...base, today } as never).classified.find((i: { key: string }) => i.key === "fixed:sp-yd")?.paidAmount ?? null;
+  eq("★스냅샷 종단: 오늘 6/20 이면 용돈 미출금", paidOf("2026-06-20"), null);
+  eq("  스냅샷 종단: today 미지정이면 종전대로 출금됨", paidOf(), 70_000);
+
+  // 카드 결제분 행(cardPaidByKey)에도 today 가 걸리는지 — 배선을 지우면 빨갛게 된다.
+  const cardItem = {
+    key: "fixed:card", sourceKind: "fixed", sourceId: "card", kind: "fixed", label: "학원비-한빛수학-이바다",
+    categoryId: null, day: 24, naturalDay: 24, dayOverridden: false, amount: 280_000,
+    accountId: null, paymentMethodId: "pm-credit", cardCharge: true,
+    baseCardCharge: true, baseAccountId: null, methodOverridden: false, released: false,
+    paidOverride: null, paidAmount: null, reason: null, amountOverridden: false, remainingAmount: 280_000, paidPartial: false,
+  } as const;
+  const cardTxn = {
+    amount: 280_000, counterparty: "다른가맹점", txn_date: "2026-06-20", type: "expense" as const,
+    account_id: null, from_account_id: null, to_account_id: null, payment_method_id: "pm-credit",
+  };
+  const cardOf = (today?: string) =>
+    computeCashMatches({
+      month: "2026-06", classified: [cardItem], paidThisMonth: new Map(), recentOutflows: [cardTxn],
+      accounts: [], methods: [{ id: "pm-credit", kind: "credit" }], today,
+    }).cardPaidByKey.get("fixed:card")?.amount ?? null;
+  eq("★카드 행: 예정일(24) 전, 상호 안 맞는 카드 결제 = 결제금액 안 붙음", cardOf("2026-06-20"), null);
+  eq("  카드 행: today 미지정이면 종전대로 붙음", cardOf(), 280_000);
+}
+
+console.log("\n[216] 대출 항목은 자기 대출에 연결된(loan_id) 상환을 먼저 받는다(설계 216) (값은 가상)");
+{
+  // 대출 이름과 거래 상호가 달라 자기 상환(3,985, loan_id 연결)을 못 받고 금액만 같은 소액 거래(4,000)를 가져가는 경우.
+  const loanItem = { key: "loan:hd", amount: 4_000, label: "약관대출-한빛생명-김하늘", day: 24, accountId: null, accountBlind: true, loanId: "loan-hd" };
+  const other = { amount: 4_000, counterparty: "별빛 코인노래방", txn_date: "2026-06-22", type: "expense", account_id: "acc-kb" };
+  const repay = { amount: 3_985, counterparty: "한빛약대이자", txn_date: "2026-06-27", type: "payment", from_account_id: "acc-toss", loan_id: "loan-hd" };
+  const at28 = { ...TOL, todayDay: 28 };
+  eq("★loan_id 연결 상환 3,985 가 정확금액 남의 거래 4,000 을 이긴다", matchOutflowActuals([loanItem], [other, repay], at28).get("loan:hd")?.counterparty, "한빛약대이자");
+  eq("  loan_id 가 없으면 종전대로 정확금액", matchOutflowActuals([loanItem], [other, { ...repay, loan_id: null }], at28).get("loan:hd")?.counterparty, "별빛 코인노래방");
+  eq("  다른 대출의 loan_id 는 우선권이 없다", matchOutflowActuals([loanItem], [other, { ...repay, loan_id: "loan-x" }], at28).get("loan:hd")?.counterparty, "별빛 코인노래방");
+
+  // ★같은 대출을 대출 원장(21,400)과 정기지출 두 줄(19,700·3,100)에 함께 등록한 경우 — 같은 loan_id 상환을 두고 겹친다.
+  //   대출 항목이 가져가면 정기지출이 미출금이 되고 두 번 계산된다.
+  const master = { key: "loan:db", amount: 21_400, label: "보험계약대출-김", day: 5, accountId: null, accountBlind: true, loanId: "loan-db" };
+  const fx1 = { key: "fixed:db1", amount: 19_700, label: "대출상환-한빛손보 약대-김하", day: 5, accountId: "acc-kb" };
+  const fx2 = { key: "fixed:db2", amount: 3_100, label: "대출상환-한빛손보 약대2-김하", day: 5, accountId: "acc-kb" };
+  const t1 = { amount: 19_700, counterparty: "한빛손보약대 공동CMS", txn_date: "2026-06-07", type: "payment", from_account_id: "acc-kb", loan_id: "loan-db" };
+  const t2 = { amount: 3_100, counterparty: "한빛손보약대 공동CMS", txn_date: "2026-06-07", type: "payment", from_account_id: "acc-kb", loan_id: "loan-db" };
+  const db = matchOutflowActuals([master, fx1, fx2], [t1, t2], TOL);
+  eq("★정기지출(19,700)은 자기 거래를 지킨다", db.get("fixed:db1")?.amount, 19_700);
+  eq("★정기지출(3,100)은 자기 거래를 지킨다", db.get("fixed:db2")?.amount, 3_100);
+  eq("★대출 항목은 허용폭 밖 loan_id 거래를 빼앗지 않는다", db.has("loan:db"), false);
+
+  // ★월납이 올라 대출 항목의 허용폭 안(20,500~20,900)에 들어와도 정기지출이 지킨다 — 금액차가 아니라
+  //   구조(정기지출이 상호+근사로 주장하는 거래는 0패스 후보에서 뺀다)로 막는다.
+  for (const amt of [20_500, 20_510, 20_900]) {
+    const drift = matchOutflowActuals([master, fx1, fx2], [{ ...t1, amount: amt }, t2], TOL);
+    eq(`★월납 ${amt} 변동: 정기지출이 받는다`, drift.get("fixed:db1")?.amount, amt);
+    eq(`  월납 ${amt} 변동: 대출 항목은 못 받는다`, drift.has("loan:db"), false);
+  }
+  // ★최근 3개월 풀에 같은 대출 상환이 여러 달 있으면, 정기지출이 한 달치를 받은 뒤 남은 달치를 대출 항목이
+  //   payment 특례(10)로 가져가 둘 다 '최근 실적 있음' → 예측 이중계상. 특례도 막는다.
+  const pool3 = ["2026-04-07", "2026-05-07", "2026-06-07"].map((d) => ({ ...t1, amount: 20_500, txn_date: d }));
+  eq("★3개월 풀: 정기지출이 받고 남은 달치를 대출 항목이 payment 특례로 못 가져간다",
+    matchOutflowActuals([master, fx1], pool3).has("loan:db"), false);
+  // 소액: 대출 4,000 과 정기지출 3,100 이 같은 loan_id 거래(3,100, 정확금액)를 두고 겹칠 때 — 정기지출이 받는다.
+  const small = matchOutflowActuals(
+    [{ ...loanItem, key: "loan:s" }, { key: "fixed:s", amount: 3_100, label: "보험료 자동이체", day: 24, accountId: null }],
+    [{ ...repay, amount: 3_100, loan_id: "loan-hd" }],
+    at28,
+  );
+  eq("★소액 겹침: 정확금액 정기지출이 loan_id 거래를 지킨다", small.has("fixed:s"), true);
+  eq("  소액 겹침: 대출 항목은 비어 있다", small.has("loan:s"), false);
+
+  // 허용폭 조건: 같은 대출에 연결됐어도 금액이 크게 다른 중도상환(900,000)은 월납 280,000 항목의 '출금됨'이 아니다.
+  const monthly = { key: "loan:m", amount: 280_000, label: "대출상환-예시", day: 24, accountId: null, accountBlind: true, loanId: "loan-m" };
+  eq("★연결됐지만 금액이 크게 다른 중도상환은 0패스로 붙지 않는다",
+    matchOutflowActuals([monthly], [{ amount: 900_000, counterparty: "중도상환", txn_date: "2026-06-26", type: "expense", loan_id: "loan-m" }], at28).has("loan:m"), false);
+
+  // ★loan_id 는 '어느 달 몫'을 증명하지 못한다 — score 50 도 날짜 가드를 받는다.
+  const late = { ...repay, txn_date: "2026-07-01" }; // 지난달분이 주말로 1일에 밀려 나감
+  const endItem = { ...loanItem, day: 30 };
+  eq("★월말 예정 대출: 전달분이 1일에 밀려 나간 상환은 오늘 5일에 '출금됨'이 안 된다(예정일 전 가드)",
+    matchOutflowActuals([endItem], [late], { ...TOL, todayDay: 5 }).has("loan:hd"), false);
+  eq("★월말 예정 대출: 오늘 미지정(과거 달)이어도 5일 넘게 이른 연결 상환은 안 붙는다(조기 가드)",
+    matchOutflowActuals([endItem], [late], TOL).has("loan:hd"), false);
+  eq("  예정일 지난 뒤의 연결 상환은 종전대로 붙는다",
+    matchOutflowActuals([endItem], [{ ...repay, txn_date: "2026-07-30" }], { ...TOL, todayDay: 31 }).get("loan:hd")?.amount, 3_985);
+}
+
+console.log("\n[218] 카드대금 부분 납부(선결제) — 낸 만큼만 출금, 남은 금액은 미지급으로 남는다 (값은 가상)");
+{
+  // 25일 예정 1,318,400(확정액) 중 5/4 에 700,000 을 미리 낸 경우 — 본 매칭은 날짜 가드로 못 붙인다.
+  const { cashflowSnapshot } = await import("../src/lib/household/cashflow-snapshot");
+  const MONTH = "2026-05";
+  const OWNER = "owner-1";
+  const sp = (id: string, title: string, amount: number, day: number, account: string) =>
+    ({
+      id, owner_auth_uid: OWNER, title, direction: "out", amount, frequency: "monthly", pay_day: day,
+      account_id: account, category_id: "cat-bill", is_active: true, start_date: null, end_date: null,
+      person_id: null, memo: null, sort_order: 0, created_at: "", updated_at: "",
+    }) as never;
+  const ov = (id: string, sourceId: string, extra: Record<string, unknown>) =>
+    ({
+      id, owner_auth_uid: OWNER, year_month: MONTH, source_kind: "fixed", source_id: sourceId,
+      amount_override: null, account_id: null, released: false, day_override: null, paid_override: null,
+      created_at: "", updated_at: "", ...extra,
+    }) as never;
+  const pay = (amount: number, counterparty: string, date: string, acc: string) =>
+    ({ amount, counterparty, txn_date: date, type: "payment", account_id: null, from_account_id: acc, to_account_id: null, payment_method_id: null });
+
+  const scheduled = [
+    sp("sp-a", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a"),
+    sp("sp-b", "카드대금-삼성카드-이바다", 610_000, 10, "acc-b"),
+  ];
+  const lastMonth = [pay(1_180_000, "삼성카드", "2026-04-27", "acc-a"), pay(590_000, "삼성카드", "2026-04-10", "acc-b")];
+  const prepay = pay(700_000, "삼성카드", "2026-05-04", "acc-a");
+  const confirmed = ov("ov-a", "sp-a", { amount_override: 1_318_400 });
+  const snapOf = (outflows: unknown[], overrides: unknown[] = [confirmed], today = "2026-05-04") =>
+    cashflowSnapshot(MONTH, {
+      scheduled, loans: [], installments: [], txns: [], methods: [],
+      recentOutflows: [...lastMonth, ...outflows], totalCash: 10_000_000, horizon: 3,
+      accountIds: ["acc-a", "acc-b"], overrides, nextOverrides: [], today,
+    } as never);
+  type Row = { key: string; paidAmount: number | null; remainingAmount: number; paidPartial: boolean };
+  const itemOf = (snap: { classified: unknown[] }, k: string) => (snap.classified as Row[]).find((i) => i.key === k);
+
+  // (a) 선결제 1건 → 부분 납부
+  const s1 = snapOf([prepay]);
+  eq("★(a) 선결제가 붙는다: 출금 700,000", itemOf(s1, "fixed:sp-a")?.paidAmount, 700_000);
+  eq("★(a) 남은 금액 618,400 은 미지급으로 남는다", itemOf(s1, "fixed:sp-a")?.remainingAmount, 618_400);
+  eq("  (a) 부분 납부 표식", itemOf(s1, "fixed:sp-a")?.paidPartial, true);
+  eq("★(a) 미지급 합계에 남은 금액만 든다(이바다 610,000 + 618,400)", s1.pendingOutAll, 610_000 + 618_400);
+  eq("  (a) 지급 합계는 실제 낸 돈", s1.paidOutAll, 700_000);
+  // (f) 익월 기본값은 낸 합계가 아니라 예정금액
+  const nextA = (s1.nextItems as { key: string; amount: number }[]).find((i) => i.key === "fixed:sp-a");
+  eq("★(f) 부분 납부면 익월 기본값 = 당월 예정금액(1,318,400), 낸 합계 아님", nextA?.amount, 1_318_400);
+
+  // (b) 나머지 납부 → 완납
+  const s2 = snapOf([prepay, pay(618_400, "삼성카드", "2026-05-25", "acc-a")], [confirmed], "2026-05-25");
+  eq("★(b) 나머지까지 내면 합계 1,318,400 완납", itemOf(s2, "fixed:sp-a")?.paidAmount, 1_318_400);
+  eq("★(b) 완납이면 남은 금액 0", itemOf(s2, "fixed:sp-a")?.remainingAmount, 0);
+  eq("  (b) 완납은 부분 납부 아님", itemOf(s2, "fixed:sp-a")?.paidPartial, false);
+
+  // (c) 수기 출금금액도 같은 뜻 — 0 은 미출금
+  const s3 = snapOf([], [ov("ov-a", "sp-a", { amount_override: 1_318_400, paid_override: 700_000 })]);
+  eq("★(c) 수기 출금금액 700,000 → 부분 납부, 남은 618,400", itemOf(s3, "fixed:sp-a")?.remainingAmount, 618_400);
+  const s4 = snapOf([prepay], [ov("ov-a", "sp-a", { amount_override: 1_318_400, paid_override: 0 })]);
+  eq("  (c) 수기 0 = 미출금(설계 65 2차) — 예정금액 전부 남음", itemOf(s4, "fixed:sp-a")?.remainingAmount, 1_318_400);
+
+  // (d) 다른 명의 계좌의 같은 카드사 납부는 안 붙는다
+  const s5 = snapOf([pay(400_000, "삼성카드", "2026-05-06", "acc-b")]);
+  eq("★(d) 다른 계좌의 삼성카드 납부는 김하늘 항목에 안 붙는다", itemOf(s5, "fixed:sp-a")?.paidAmount ?? null, null);
+
+  // (e) 다른 카드사 납부는 안 붙는다
+  const s6 = snapOf([pay(400_000, "롯데카드", "2026-05-06", "acc-a")]);
+  eq("★(e) 롯데카드 납부는 삼성카드 항목에 안 붙는다", itemOf(s6, "fixed:sp-a")?.paidAmount ?? null, null);
+
+  // (g) 종전 완납(본 매칭 1건, 확정액과 같음)은 그대로
+  const s7 = snapOf([pay(1_318_400, "삼성카드", "2026-05-25", "acc-a")], [confirmed], "2026-05-25");
+  eq("★(g) 확정액 그대로 낸 달은 종전대로 완납", itemOf(s7, "fixed:sp-a")?.remainingAmount, 0);
+  eq("  (g) 출금금액도 종전 그대로", itemOf(s7, "fixed:sp-a")?.paidAmount, 1_318_400);
+  // (g2) 청구액 확정 전(추정액)이면 덜 낸 것처럼 보여도 부분 납부로 보지 않는다 — 추정은 "덜 냈다"의 근거가 못 된다
+  const s8 = snapOf([pay(1_000_000, "삼성카드", "2026-05-25", "acc-a")], [], "2026-05-25");
+  eq("★(g2) 추정액 1,240,000 · 1,000,000 납부(확정 전)는 완납", itemOf(s8, "fixed:sp-a")?.remainingAmount, 0);
+
+  // (h) 지난달 납부가 없었으면 월초 거래는 지난달 몫일 수 있어 받지 않는다(설계 216 과 같은 논리)
+  const noLast = cashflowSnapshot(MONTH, {
+    scheduled, loans: [], installments: [], txns: [], methods: [],
+    recentOutflows: [pay(1_180_000, "삼성카드", "2026-05-02", "acc-a")], totalCash: 10_000_000, horizon: 3,
+    accountIds: ["acc-a", "acc-b"], overrides: [confirmed], nextOverrides: [], today: "2026-05-04",
+  } as never);
+  eq("★(h) 지난달 납부 없음 + 월초(5/2) 납부 → 이번 달 몫으로 안 본다", itemOf(noLast, "fixed:sp-a")?.paidAmount ?? null, null);
+  // (h2) 지난달 납부가 있었으면 월초 거래는 선결제
+  const s9 = snapOf([pay(250_000, "삼성카드", "2026-05-02", "acc-a")]);
+  eq("  (h2) 지난달 납부가 있으면 월초 납부는 선결제로 붙는다", itemOf(s9, "fixed:sp-a")?.paidAmount, 250_000);
+
+  // (i) 카드대금 아닌 항목은 부분 납부가 없다 — 수기 출금금액이 예정보다 적어도 종전대로 완납
+  const misc = cashflowSnapshot(MONTH, {
+    scheduled: [sp("sp-m", "관리비-한빛아파트", 240_000, 25, "acc-a")], loans: [], installments: [], txns: [], methods: [],
+    recentOutflows: [{ amount: 240_000, counterparty: "한빛아파트", txn_date: "2026-04-25", type: "expense", from_account_id: "acc-a" }],
+    totalCash: 10_000_000, horizon: 3, accountIds: ["acc-a"],
+    overrides: [ov("ov-m", "sp-m", { amount_override: 240_000, paid_override: 90_000 })], nextOverrides: [], today: "2026-05-25",
+  } as never);
+  eq("★(i) 카드대금 아닌 항목은 수기 출금금액이 적어도 남은 금액 0(종전)", itemOf(misc, "fixed:sp-m")?.remainingAmount, 0);
+}
+
+console.log("\n[218-2] 안 붙여야 할 것을 붙이지 않는다 — 확정 전 추정액 · 카드론 상환 · 완납한 달의 소액 납부");
+{
+  const { cashflowSnapshot } = await import("../src/lib/household/cashflow-snapshot");
+  const OWNER = "owner-1";
+  const sp = (id: string, title: string, amount: number, day: number, account: string) =>
+    ({
+      id, owner_auth_uid: OWNER, title, direction: "out", amount, frequency: "monthly", pay_day: day,
+      account_id: account, category_id: "cat-bill", is_active: true, start_date: null, end_date: null,
+      person_id: null, memo: null, sort_order: 0, created_at: "", updated_at: "",
+    }) as never;
+  const ov = (month: string, sourceId: string, extra: Record<string, unknown>) =>
+    ({
+      id: `ov-${sourceId}`, owner_auth_uid: OWNER, year_month: month, source_kind: "fixed", source_id: sourceId,
+      amount_override: null, account_id: null, released: false, day_override: null, paid_override: null,
+      created_at: "", updated_at: "", ...extra,
+    }) as never;
+  const pay = (amount: number, counterparty: string, date: string, acc: string, loan_id: string | null = null) =>
+    ({ amount, counterparty, txn_date: date, type: "payment", account_id: null, from_account_id: acc, to_account_id: null, payment_method_id: null, loan_id });
+  type Row = { key: string; paidAmount: number | null; remainingAmount: number; paidPartial: boolean };
+  const run = (month: string, scheduled: unknown[], outflows: unknown[], overrides: unknown[], today?: string) =>
+    (cashflowSnapshot(month, {
+      scheduled, loans: [], installments: [], txns: [], methods: [], recentOutflows: outflows,
+      totalCash: 10_000_000, horizon: 3, accountIds: ["acc-a", "acc-b"], overrides, nextOverrides: [], today,
+    } as never).classified as Row[]);
+
+  // (j) 확정 전 추정액: 추정 1,520,000 · 실제 청구 960,000 완납 → 부분 납부 아님
+  const j = run("2026-03", [sp("hd", "카드대금-현대카드-이바다", 1_520_000, 1, "acc-b")],
+    [pay(1_090_000, "현대카드대금", "2026-02-03", "acc-b"), pay(960_000, "현대카드대금", "2026-03-02", "acc-b")], [], "2026-03-31");
+  eq("★(j) 확정 전 추정액보다 적게 낸 달은 완납(남은 금액 0)", j.find((i) => i.key === "fixed:hd")?.remainingAmount, 0);
+  eq("  (j) 출금금액은 종전 그대로 960,000", j.find((i) => i.key === "fixed:hd")?.paidAmount, 960_000);
+  // (j2) 확정 전이면 선결제도 종전대로 안 붙는다(예정일 전 · 날짜 가드)
+  const j2 = run("2026-05", [sp("sa", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a")],
+    [pay(1_180_000, "삼성카드", "2026-04-27", "acc-a"), pay(700_000, "삼성카드", "2026-05-04", "acc-a")], [], "2026-05-04");
+  eq("★(j2) 청구액 미확정이면 선결제는 종전대로 미출금", j2.find((i) => i.key === "fixed:sa")?.paidAmount ?? null, null);
+
+  // (k) 카드론 상환(loan_id 연결)은 같은 상호·계좌여도 카드대금에 더하지 않는다
+  const k = run("2026-03", [sp("sa", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a")],
+    [pay(1_150_000, "삼성카드", "2026-02-25", "acc-a"), pay(480_000, "삼성카드", "2026-03-04", "acc-a", "loan-card"), pay(800_000, "삼성카드", "2026-03-19", "acc-a")],
+    [ov("2026-03", "sa", { amount_override: 1_275_000 })], "2026-03-20");
+  eq("★(k) 카드론 상환은 빼고 선결제 800,000 만 합산", k.find((i) => i.key === "fixed:sa")?.paidAmount, 800_000);
+
+  // (l) 한 건으로 이미 완납한 달엔 같은 카드사 월초 소액 납부를 더하지 않는다
+  const l = run("2026-03", [sp("kb", "카드대금-국민카드-이바다", 215_000, 10, "acc-b")],
+    [pay(330_000, "KB카드", "2026-02-10", "acc-b"), pay(6_200, "KB카드", "2026-03-04", "acc-b"), pay(215_000, "KB카드", "2026-03-10", "acc-b")],
+    [ov("2026-03", "kb", { amount_override: 215_000 })], "2026-03-31");
+  eq("★(l) 완납한 달의 출금금액은 본 매칭 한 건 그대로(소액 납부 안 얹음)", l.find((i) => i.key === "fixed:kb")?.paidAmount, 215_000);
+}
+
+console.log("\n[218-3] 명의가 애매한 납부는 합산하지 않는다 · 예측·월말잔액도 남은 금액만");
+{
+  const { cashflowSnapshot } = await import("../src/lib/household/cashflow-snapshot");
+  const OWNER = "owner-1";
+  const MONTH = "2026-05";
+  const sp = (id: string, title: string, amount: number, day: number, account: string | null) =>
+    ({
+      id, owner_auth_uid: OWNER, title, direction: "out", amount, frequency: "monthly", pay_day: day,
+      account_id: account, category_id: "cat-bill", is_active: true, start_date: null, end_date: null,
+      person_id: null, memo: null, sort_order: 0, created_at: "", updated_at: "",
+    }) as never;
+  const ov = (sourceId: string, extra: Record<string, unknown>) =>
+    ({
+      id: `ov-${sourceId}`, owner_auth_uid: OWNER, year_month: MONTH, source_kind: "fixed", source_id: sourceId,
+      amount_override: null, account_id: null, released: false, day_override: null, paid_override: null,
+      created_at: "", updated_at: "", ...extra,
+    }) as never;
+  const pay = (amount: number, counterparty: string, date: string, acc: string) =>
+    ({ amount, counterparty, txn_date: date, type: "payment", account_id: null, from_account_id: acc, to_account_id: null, payment_method_id: null, loan_id: null });
+  type Row = { key: string; paidAmount: number | null; remainingAmount: number };
+  const snapOf = (scheduled: unknown[], outflows: unknown[], overrides: unknown[], today: string) =>
+    cashflowSnapshot(MONTH, {
+      scheduled, loans: [], installments: [], txns: [], methods: [], recentOutflows: outflows,
+      totalCash: 10_000_000, horizon: 3, accountIds: ["acc-a", "acc-b"], overrides, nextOverrides: [], today,
+    } as never);
+  const row = (snap: { classified: unknown[] }, k: string) => (snap.classified as Row[]).find((i) => i.key === k);
+
+  // (m) 같은 카드사 두 명의가 한 통장(acc-a)에서 빠진다 — 5/12 350,000 은 누구 몫인지 모른다
+  const two = [sp("ma", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a"), sp("mb", "카드대금-삼성카드-이바다", 420_000, 20, "acc-a")];
+  const lastBoth = [pay(1_100_000, "삼성카드", "2026-04-25", "acc-a"), pay(380_000, "삼성카드", "2026-04-20", "acc-a")];
+  const m1 = snapOf(two, [...lastBoth, pay(350_000, "삼성카드", "2026-05-12", "acc-a")], [ov("ma", { amount_override: 1_318_400 })], "2026-05-21");
+  eq("★(m) 같은 통장 두 명의면 확정 항목이 남의 납부를 합산하지 않는다", row(m1, "fixed:ma")?.paidAmount ?? null, null);
+  // 상대 항목에 수기 350,000 을 넣어 바로잡아도 같은 돈이 두 번 차감되지 않는다
+  const m2 = snapOf(two, [...lastBoth, pay(350_000, "삼성카드", "2026-05-12", "acc-a")],
+    [ov("ma", { amount_override: 1_318_400 }), ov("mb", { paid_override: 350_000 })], "2026-05-21");
+  eq("★(m) 수기로 바로잡은 뒤 미지급 = 김하늘 확정액 전부(1,318,400), 350,000 이중 차감 없음", m2.pendingOutAll, 1_318_400);
+
+  // (p) 상대 명의 항목의 계좌가 비어 있고 수기로 바로잡아도 이중 차감 없음
+  const pTwo = [sp("pa", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a"), sp("pb", "카드대금-삼성카드-이바다", 420_000, 20, null)];
+  const p = snapOf(pTwo, [...lastBoth, pay(350_000, "삼성카드", "2026-05-12", "acc-a")],
+    [ov("pa", { amount_override: 1_318_400 }), ov("pb", { paid_override: 350_000 })], "2026-05-21");
+  eq("★(p) 상대 계좌 미지정 + 수기 수정 → 미지급 1,318,400(이중 차감 없음)", p.pendingOutAll, 1_318_400);
+  // (q) 상대 명의가 본 매칭으로 이미 완납했으면 내 선결제는 정상으로 붙는다
+  const q = snapOf(two, [...lastBoth, pay(800_000, "삼성카드", "2026-05-12", "acc-a"), pay(420_000, "삼성카드", "2026-05-20", "acc-a")],
+    [ov("ma", { amount_override: 1_318_400 }), ov("mb", { amount_override: 420_000 })], "2026-05-21");
+  eq("★(q) 상대가 완납한 달엔 내 선결제 800,000 이 붙는다", row(q, "fixed:ma")?.paidAmount, 800_000);
+  eq("  (q) 상대는 자기 납부 420,000 그대로", row(q, "fixed:mb")?.paidAmount, 420_000);
+
+  // (r) 상대가 본 매칭으로 완납이어도 수기 출금금액을 넣었으면 어느 거래를 썼는지 모른다 → 다투는 것으로 본다
+  const r = snapOf(two, [...lastBoth, pay(350_000, "삼성카드", "2026-05-12", "acc-a"), pay(420_000, "삼성카드", "2026-05-20", "acc-a")],
+    [ov("ma", { amount_override: 1_318_400 }), ov("mb", { paid_override: 770_000 })], "2026-05-21");
+  eq("★(r) 수기 입력한 상대가 있으면 그 통장 납부를 합산하지 않는다", row(r, "fixed:ma")?.paidAmount ?? null, null);
+
+  // (n) 계좌 미지정 항목은 합산하지 않는다(다른 명의 통장 납부 흡수 방지)
+  const n = snapOf([sp("na", "카드대금-삼성카드-김하늘", 1_240_000, 25, null)],
+    [pay(900_000, "삼성카드", "2026-04-25", "acc-b"), pay(250_000, "삼성카드", "2026-05-12", "acc-b")], [ov("na", { amount_override: 1_318_400 })], "2026-05-21");
+  eq("★(n) 계좌 미지정 카드대금은 다른 통장 납부를 합산하지 않는다", row(n, "fixed:na")?.paidAmount ?? null, null);
+
+  // (o) 당월 예측·월말 현금도 남은 금액만 뺀다
+  const o = snapOf([sp("oa", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a")],
+    [pay(1_180_000, "삼성카드", "2026-04-27", "acc-a"), pay(700_000, "삼성카드", "2026-05-04", "acc-a")], [ov("oa", { amount_override: 1_318_400 })], "2026-05-04");
+  eq("★(o) 당월 예측 출금 = 남은 618,400", o.currentForecastOut, 618_400);
+  eq("★(o) 월말 현금 = 현재 잔액 − 남은 618,400", o.monthEndCash, 10_000_000 - 618_400);
+}
+
+console.log("\n[218-4] 경계값 — 허용오차 · 월초 5일 · 지난달 판정 · 거래 종류");
+{
+  const { cashflowSnapshot, cardBillShortfall } = await import("../src/lib/household/cashflow-snapshot");
+  // 허용오차 max(1,000원, 0.5%) — 확정액만 따진다
+  const conf = (amount: number) => ({ amount, amountOverridden: true });
+  eq("★허용오차: 1,318,400 중 남음 6,592(0.5% 이내) → 완납", cardBillShortfall(conf(1_318_400), 1_311_808), 0);
+  eq("★허용오차: 남음 6,593(0.5% 초과) → 부분", cardBillShortfall(conf(1_318_400), 1_311_807), 6_593);
+  eq("★허용오차 바닥 1,000원: 100,000 중 99,000 → 완납", cardBillShortfall(conf(100_000), 99_000), 0);
+  eq("★허용오차 바닥 1,000원: 98,999 → 부분 1,001", cardBillShortfall(conf(100_000), 98_999), 1_001);
+  eq("  허용오차 경계 정확히 1,000(200,000 의 0.5%) → 완납", cardBillShortfall(conf(200_000), 199_000), 0);
+  eq("  초과 납부 → 0", cardBillShortfall(conf(1_318_400), 1_400_000), 0);
+  eq("  확정 전 금액 → 0", cardBillShortfall({ amount: 1_318_400, amountOverridden: false }, 700_000), 0);
+  eq("  납부 0 → 0", cardBillShortfall(conf(1_318_400), 0), 0);
+
+  const OWNER = "owner-1", MONTH = "2026-05";
+  const sched = [{
+    id: "ba", owner_auth_uid: OWNER, title: "카드대금-삼성카드-김하늘", direction: "out", amount: 1_240_000, frequency: "monthly", pay_day: 25,
+    account_id: "acc-a", category_id: "cat-bill", is_active: true, start_date: null, end_date: null, person_id: null, memo: null, sort_order: 0, created_at: "", updated_at: "",
+  }] as never[];
+  const ovA = [{
+    id: "ov-ba", owner_auth_uid: OWNER, year_month: MONTH, source_kind: "fixed", source_id: "ba", amount_override: 1_318_400,
+    account_id: null, released: false, day_override: null, paid_override: null, created_at: "", updated_at: "",
+  }] as never[];
+  const pay = (amount: number, date: string, acc = "acc-a", extra: Record<string, unknown> = {}) =>
+    ({ amount, counterparty: "삼성카드", txn_date: date, type: "payment", account_id: null, from_account_id: acc, to_account_id: null, payment_method_id: null, loan_id: null, ...extra });
+  type Row = { key: string; paidAmount: number | null; remainingAmount: number; paidPartial: boolean };
+  const rowOf = (outflows: unknown[]) =>
+    (cashflowSnapshot(MONTH, {
+      scheduled: sched, loans: [], installments: [], txns: [], methods: [], recentOutflows: outflows,
+      totalCash: 10_000_000, horizon: 3, accountIds: ["acc-a", "acc-b"], overrides: ovA, nextOverrides: [], today: "2026-05-21",
+    } as never).classified as Row[]).find((i) => i.key === "fixed:ba")!;
+  const notAttached = (name: string, r: Row) => {
+    eq(`★${name} — 안 붙음`, r.paidAmount ?? null, null);
+    eq(`  ${name} — 확정액 전부 미지급`, r.remainingAmount, 1_318_400);
+  };
+
+  // 월초 5일 경계(지난달 납부 없음): 5일은 지난달 몫일 수 있어 안 붙고, 6일부터 선결제
+  notAttached("월초 경계 5/5(지난달 납부 없음)", rowOf([pay(400_000, "2026-05-05")]));
+  eq("★월초 경계 5/6(지난달 납부 없음) — 선결제로 붙는다", rowOf([pay(400_000, "2026-05-06")]).paidAmount, 400_000);
+
+  // 지난달 판정은 직전 달·같은 계좌·loan_id 없는 납부만
+  notAttached("지난달 판정: 두 달 전(3월) 납부뿐", rowOf([pay(900_000, "2026-03-25"), pay(400_000, "2026-05-02")]));
+  notAttached("지난달 판정: 4월 납부가 카드론 상환뿐", rowOf([pay(480_000, "2026-04-04", "acc-a", { loan_id: "loan-card" }), pay(400_000, "2026-05-02")]));
+  notAttached("지난달 판정: 4월 납부가 다른 계좌뿐", rowOf([pay(900_000, "2026-04-25", "acc-b"), pay(400_000, "2026-05-02")]));
+
+  // 거래 종류: payment 만 합산(같은 상호의 일반 지출은 아니다)
+  const exp = rowOf([pay(900_000, "2026-04-25"), { ...pay(250_000, "2026-05-12"), type: "expense" }]);
+  notAttached("거래 종류: 상호 '삼성카드' expense", exp);
+  eq("  부분 납부 표식 없음", exp.paidPartial, false);
+}
+
+console.log("\n[218-5] 접두어 상호 · 선결제 뺀 확정액 · 월말 카드의 월초 밀림");
+{
+  const { cashflowSnapshot } = await import("../src/lib/household/cashflow-snapshot");
+  const OWNER = "owner-1", MONTH = "2026-05";
+  const sp = (id: string, title: string, amount: number, day: number, account: string) =>
+    ({
+      id, owner_auth_uid: OWNER, title, direction: "out", amount, frequency: "monthly", pay_day: day,
+      account_id: account, category_id: "cat-bill", is_active: true, start_date: null, end_date: null,
+      person_id: null, memo: null, sort_order: 0, created_at: "", updated_at: "",
+    }) as never;
+  const ov = (sourceId: string, amount: number) =>
+    ({
+      id: `ov-${sourceId}`, owner_auth_uid: OWNER, year_month: MONTH, source_kind: "fixed", source_id: sourceId,
+      amount_override: amount, account_id: null, released: false, day_override: null, paid_override: null, created_at: "", updated_at: "",
+    }) as never;
+  const pay = (amount: number, counterparty: string, date: string, acc: string) =>
+    ({ amount, counterparty, txn_date: date, type: "payment", account_id: null, from_account_id: acc, to_account_id: null, payment_method_id: null, loan_id: null });
+  type Row = { key: string; paidAmount: number | null; remainingAmount: number };
+  const run = (scheduled: unknown[], outflows: unknown[], overrides: unknown[], today: string) => {
+    const snap = cashflowSnapshot(MONTH, {
+      scheduled, loans: [], installments: [], txns: [], methods: [], recentOutflows: outflows,
+      totalCash: 10_000_000, horizon: 3, accountIds: ["acc-a", "acc-b"], overrides, nextOverrides: [], today,
+    } as never);
+    return { snap, row: (k: string) => (snap.classified as Row[]).find((i) => i.key === k)! };
+  };
+
+  // (s) 상호 "현대카드대금" 은 삼성카드 항목의 납부가 아니다 — 항목명 접두어 "카드대금" 이 상호에 걸리면 안 된다
+  const s = run(
+    [sp("ss", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a"), sp("hd", "카드대금-현대카드-이바다", 640_000, 1, "acc-b")],
+    [pay(1_180_000, "삼성카드", "2026-04-27", "acc-a"), pay(640_000, "현대카드대금", "2026-05-01", "acc-b"), pay(250_000, "현대카드대금", "2026-05-15", "acc-a")],
+    [ov("ss", 1_318_400)], "2026-05-16");
+  eq("★(s) '현대카드대금' 납부는 삼성카드 항목에 합산되지 않는다", s.row("fixed:ss").paidAmount ?? null, null);
+  eq("  (s) 삼성 미지급은 확정액 전부", s.row("fixed:ss").remainingAmount, 1_318_400);
+  // (s2) 같은 통장의 현대카드 항목은 자기 '현대카드대금' 선결제를 받는다(삼성과 다투지 않는다)
+  const s2 = run(
+    [sp("ss", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a"), sp("hd", "카드대금-현대카드-김하늘", 980_000, 24, "acc-a")],
+    [pay(1_180_000, "삼성카드", "2026-04-27", "acc-a"), pay(940_000, "현대카드대금", "2026-04-24", "acc-a"), pay(380_000, "현대카드대금", "2026-05-08", "acc-a")],
+    [ov("ss", 1_318_400), ov("hd", 980_000)], "2026-05-09");
+  eq("★(s2) 같은 통장 현대카드 항목이 자기 선결제 380,000 을 받는다", s2.row("fixed:hd").paidAmount, 380_000);
+
+  // (t) 선결제 뺀 '남은 청구액'을 확정액으로 넣은 경우 — 합산이 확정액을 넘으면 버리고 종전대로 둔다
+  const t = run([sp("ss", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a")],
+    [pay(1_180_000, "삼성카드", "2026-04-27", "acc-a"), pay(700_000, "삼성카드", "2026-05-04", "acc-a")], [ov("ss", 618_400)], "2026-05-15");
+  eq("★(t) 확정액 618,400 < 선결제 700,000 → 완납으로 보지 않는다(미지급 618,400 유지)", t.row("fixed:ss").remainingAmount, 618_400);
+  eq("  (t) 출금금액은 종전대로 비어 있다", t.row("fixed:ss").paidAmount ?? null, null);
+
+  // (v) 선결제+잔액으로 완납한 달에 같은 카드사 소액 납부가 섞여도 완납(소액만 빠진다)
+  const v1 = run([sp("ss", "카드대금-삼성카드-김하늘", 1_240_000, 25, "acc-a")],
+    [pay(1_180_000, "삼성카드", "2026-04-25", "acc-a"), pay(700_000, "삼성카드", "2026-05-04", "acc-a"), pay(618_400, "삼성카드", "2026-05-20", "acc-a"), pay(8_300, "삼성카드", "2026-05-22", "acc-a")],
+    [ov("ss", 1_318_400)], "2026-05-23");
+  eq("★(v) 선결제+잔액 완납 + 소액 8,300 → 남은 금액 0", v1.row("fixed:ss").remainingAmount, 0);
+  eq("  (v) 출금금액은 확정액만큼(소액 제외)", v1.row("fixed:ss").paidAmount, 1_318_400);
+  const v2 = run([sp("kb", "카드대금-국민카드-이바다", 215_000, 10, "acc-b")],
+    [pay(330_000, "KB카드", "2026-04-10", "acc-b"), pay(6_200, "KB카드", "2026-05-03", "acc-b"), pay(110_000, "KB카드", "2026-05-07", "acc-b"), pay(105_000, "KB카드", "2026-05-10", "acc-b")],
+    [ov("kb", 215_000)], "2026-05-11");
+  eq("★(v2) 국민카드 선결제 110,000 + 잔액 105,000 완납 + 월초 6,200 → 남은 금액 0", v2.row("fixed:kb").remainingAmount, 0);
+
+  // (u) 30일 예정 카드가 매달 다음 달 초에 빠지는 패턴 — 5/2 의 4월 몫을 5월 선결제로 보지 않는다
+  const u = run([sp("lt", "카드대금-롯데카드-김하늘", 720_000, 30, "acc-a")],
+    [pay(690_000, "롯데카드", "2026-04-01", "acc-a"), pay(705_000, "롯데카드", "2026-05-02", "acc-a")], [ov("lt", 760_000)], "2026-05-10");
+  eq("★(u) 월말 카드의 월초 밀림 납부는 이번 달 선결제가 아니다", u.row("fixed:lt").paidAmount ?? null, null);
+  eq("  (u) 미지급은 확정액 전부", u.snap.pendingOutAll, 760_000);
+}
+
+console.log("\n[219] loan_id 짝은 max(1,000원, 5%) 까지 받는다 — 변동금리로 월납이 바뀐 첫 달(설계 219) (값은 가상)");
+{
+  // 예정 512,300 · 실제 506,800(1.1%, loan_id 연결) — 근사-정밀(0.5%) 밖이라 종전에는 '출금 없음'이었다.
+  const item = { key: "loan:ga", amount: 512_300, label: "주택담보대출", day: 5, accountId: null, accountBlind: true, loanId: "loan-ga" };
+  const t = { amount: 506_800, counterparty: "대출원리금납입", txn_date: "2026-05-06", type: "payment", from_account_id: "acc-a", loan_id: "loan-ga" };
+  eq("★1.1% 다른 loan_id 상환이 붙는다", matchOutflowActuals([item], [t], { ...TOL, todayDay: 6 }).get("loan:ga")?.amount, 506_800);
+  eq("  loan_id 가 없으면 종전대로 안 붙는다(허용폭은 loan_id 짝만)", matchOutflowActuals([item], [{ ...t, loan_id: null }], { ...TOL, todayDay: 6 }).has("loan:ga"), false);
+  eq("  5% 경계 안(486,700)은 붙는다", matchOutflowActuals([item], [{ ...t, amount: 486_700 }], { ...TOL, todayDay: 6 }).has("loan:ga"), true);
+  eq("★5% 경계 밖(486,600)은 안 붙는다", matchOutflowActuals([item], [{ ...t, amount: 486_600 }], { ...TOL, todayDay: 6 }).has("loan:ga"), false);
+  // 넓힌 허용폭에도 날짜 가드는 그대로(설계 216) — 30일 예정 상환이 2% 다른 금액으로 한참 일찍 나간 것은 이번 달 몫이 아니다.
+  const item30 = { ...item, day: 30 };
+  const early = { ...t, amount: 501_000, txn_date: "2026-05-01" };
+  eq("★허용폭 안(2.2%)이어도 조기 가드를 받는다", matchOutflowActuals([item30], [early], TOL).has("loan:ga"), false);
+  eq("★허용폭 안이어도 예정일 전 가드를 받는다", matchOutflowActuals([item30], [{ ...early, txn_date: "2026-05-27" }], { ...TOL, todayDay: 28 }).has("loan:ga"), false);
+  eq("  예정일이 지나면 붙는다", matchOutflowActuals([item30], [{ ...early, txn_date: "2026-05-27" }], { ...TOL, todayDay: 30 }).has("loan:ga"), true);
+  // 정기지출과 겹친 대출: 20,900 은 대출 21,400 과 500원 차 — 1,000원 하한 안이라 금액으로는 못 막는다.
+  //   정기지출이 정확금액으로 주장하므로 구조 방어(claimedByNonLoan)가 막는다.
+  const master = { key: "loan:db", amount: 21_400, label: "보험계약대출-김", day: 5, accountId: null, accountBlind: true, loanId: "loan-db" };
+  const fx1 = { key: "fixed:db1", amount: 20_900, label: "대출상환-한빛손보 약대-김하", day: 5, accountId: "acc-kb" };
+  const tdb = { amount: 20_900, counterparty: "한빛손보약대 공동CMS", txn_date: "2026-05-07", type: "payment", from_account_id: "acc-kb", loan_id: "loan-db" };
+  const db = matchOutflowActuals([master, fx1], [tdb], TOL);
+  eq("★허용폭 안이어도 정기지출이 주장하는 거래는 대출 항목이 못 가져간다", db.get("fixed:db1")?.amount, 20_900);
+  eq("  대출 항목은 비어 있다", db.has("loan:db"), false);
 }
 
 console.log(fail === 0 ? "\n전부 통과 ✅" : `\n실패 ${fail}건 ❌`);

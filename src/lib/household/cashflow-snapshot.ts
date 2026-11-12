@@ -4,7 +4,9 @@
 
 import {
   cashflowCalendar,
+  effectiveLoanPayments,
   matchOutflowActuals,
+  outflowCounterpartyHit,
   outflowsForMatching,
   projectMonths,
   receivedInflowIds,
@@ -38,6 +40,8 @@ export interface OutItem {
   naturalDay: number | null; // 캘린더 자연 납부일(pay_day/billing_day)
   dayOverridden: boolean; // 사용자가 날짜를 직접 지정(확정)했는가
   amount: number; // 예상금액
+  /** 그 달 금액을 사람이 확정했는가(override.amount_override) — 카드대금 부분 납부·선결제 합산은 확정 항목만 따진다(설계 218). */
+  amountOverridden: boolean;
   accountId: string | null;
   /** 결제수단(고정비에 지정된 카드 등) — 표의 출금계좌 칸에 카드명을 보여주는 데 쓴다. (설계 108) */
   paymentMethodId: string | null;
@@ -85,8 +89,123 @@ export const RELEASE_REASON_LABEL: Record<"manual" | "undated" | "no-recent", st
 };
 
 export interface ClassifiedItem extends OutItem {
-  paidAmount: number | null; // 이번 달 매칭 실지급액(수기 paid_override 우선)
+  paidAmount: number | null; // 이번 달 매칭 실지급액(수기 paid_override 우선). 확정액 카드대금은 본 매칭 + 선결제 합산(cardBillPaymentsByKey) 결과(설계 218)
+  /**
+   * 이번 달에 아직 나갈 돈 — 미출금이면 amount, 완납이면 0, **부분 납부면 amount − paidAmount**(설계 218 —
+   *   확정액 카드대금 한정, 그 외 항목은 출금이 있으면 0).
+   * ★'아직 안 나갔다'는 판정은 `!paidAmount` 가 아니라 이 값으로 한다 — 부분 납부한 카드대금의 남은 금액이
+   *   미지급·월말 잔액에서 사라지면 잔액이 그만큼 부풀려진다.
+   */
+  remainingAmount: number;
+  paidPartial: boolean; // 부분 납부(설계 218) — 익월 기본값은 예정금액, 화면은 완납 표시 대신 '남음'
   reason: ReleaseReason; // null이면 예정(active)
+}
+
+/**
+ * 카드대금 항목(설계 218) — 정기지출 제목 규칙 `카드대금-<카드>-<명의>`.
+ * ★카테고리로 가르지 않는다 — 손으로 넣은 분류는 뒤섞이기 쉬워 판정 근거로 쓰지 않는다.
+ *   제목은 앱에서 관리하는 값이라 거래 카테고리보다 믿을 만하다.
+ */
+export function isCardBillItem(i: Pick<OutItem, "sourceKind" | "label" | "cardCharge">): boolean {
+  return i.sourceKind === "fixed" && !i.cardCharge && /^카드대금-/.test(i.label);
+}
+
+/**
+ * 카드대금 납부 합계(또는 수기 출금금액)가 예정금액에 못 미치는 만큼(부분 납부의 남은 금액). 완납으로 볼 수 있으면 0. (설계 218)
+ * ★그 달 청구액을 사람이 확정한(amount_override) 항목만 따진다 — 확정 전 금액은 추정이라 '덜 냈다'를 판정할 수 없다.
+ *   추정액보다 실제 청구가 훨씬 적은 달에 완납한 것을 부분 납부로 오인하면, 없는 미지급이 살아나 월말 현금이 그만큼 줄어든다.
+ * 허용오차 max(1,000원, 0.5%) — 확정액은 원 단위로 맞는 값이다.
+ */
+export function cardBillShortfall(item: Pick<OutItem, "amount" | "amountOverridden">, paid: number): number {
+  if (!item.amountOverridden || !(paid > 0)) return 0;
+  const rest = item.amount - paid;
+  return rest > Math.max(1000, item.amount * 0.005) ? rest : 0;
+}
+
+/**
+ * 카드대금 항목별 그 달 납부 거래(설계 218) — 본 매칭(paidThisMonth)이 붙인 거래 + **본 매칭이 안 쓴** 같은 카드사 납부.
+ * 왜 따로 도는가: 본 매칭은 한 항목에 거래 하나(greedy 1:1)이고, 예정일 전 거래는 날짜 가드(설계 131: 5일 넘게 이른 거래 ·
+ *   212: 예정일 전엔 score 40 만)로 떨어뜨린다. 그래서 대금 일부를 예정일보다 한참 먼저 낸 선결제가 어디에도 안 붙는다.
+ * 대상 항목 = 청구액을 확정한 카드대금 · 본 매칭이 payment 이거나 없음 · 본 매칭 한 건으로 아직 완납이 아님.
+ * 후보 = 본 매칭이 안 쓴 당월 payment · loan_id 없음 · 상호일치(본 매칭과 같은 outflowCounterpartyHit) ·
+ *   계좌 게이트(둘 다 계좌를 알고 같을 때만 — 본 매칭(설계 166)의 "모르면 통과"보다 엄격하다. 합산은 금액을 안 보기 때문) ·
+ *   다른 카드대금 항목이 주장할 수 없을 것(contested — 누구 몫인지 모르면 합산하지 않는다).
+ * ★날짜 가드를 면제하는 대신 두 가지로 막는다:
+ *   1. 남은 금액은 미지급으로 남는다(cardBillShortfall) — 선결제가 붙어도 '다 나갔다'가 되지 않는다.
+ *   2. 지난달 몫이 이번 달 초에 늦게 나간 것(설계 216 과 같은 논리: 상호는 '어느 카드'만 증명하고 '어느 달 몫'은
+ *      증명하지 못한다)을 막기 위해, **지난달에 그 항목의 납부가 없었으면** 월초(EARLY_DAY_TOLERANCE 일 이내) 거래는 받지 않는다.
+ *      지난달 납부가 있었으면 이번 달 초 거래는 이번 달 몫의 선결제다.
+ * 본 매칭 결과(paidThisMonth)는 바꾸지 않는다 — 다른 화면(전월 표시·다른 계좌 표시)이 1:1 결과를 그대로 쓴다.
+ */
+export function cardBillPaymentsByKey(
+  items: OutItem[],
+  monthOutflows: ActualOutflow[],
+  prevMonthOutflows: ActualOutflow[],
+  paidThisMonth: Map<string, ActualOutflow>,
+): Map<string, ActualOutflow[]> {
+  const out = new Map<string, ActualOutflow[]>();
+  const used = new Set(paidThisMonth.values());
+  // ★계좌는 **둘 다 알고 같을 때만** 통과한다 — 본 매칭(설계 166)은 모르면 통과시키지만 거기엔 금액 점수가 있다.
+  //   합산 경로는 금액을 안 보므로, 계좌 미지정 항목이 남의 명의 납부를 흡수한다.
+  const accOf = (t: ActualOutflow) => t.from_account_id ?? t.account_id ?? null;
+  const accOk = (i: OutItem, t: ActualOutflow) => i.accountId != null && accOf(t) === i.accountId;
+  // ★상호일치는 이름에서 `카드대금-` 접두어를 떼고 본다 — 붙인 채면 앞 4자 "카드대금"이 **"카드대금"이 든 모든 상호**
+  //   ("○○카드대금"·"○○카드결제대금")에 맞아 다른 카드사 납부가 붙는다. 본 매칭은 금액 점수가 있어
+  //   덜 위험하지만 합산은 금액을 안 본다.
+  const issuerHit = (i: OutItem, t: ActualOutflow) => outflowCounterpartyHit(i.label.replace(/^카드대금-/, ""), t.counterparty);
+  const billItems = items.filter((x) => isCardBillItem(x) && !x.released);
+  // ★다른 카드대금 항목도 같은 상호·같은 계좌로 그 거래를 주장할 수 있으면 누구 몫인지 모른다 → 합산하지 않는다.
+  //   같은 카드사 두 명의가 한 통장에서 빠지면, 금액 큰 항목이 남의 납부를 가져가고 남이 수기로 바로잡는 순간
+  //   같은 돈이 두 번 차감된다(미지급 과소·월말 잔액 과대).
+  //   ★상대 계좌가 비어 있어도 '주장 가능'이다 — 본 매칭·수기 입력에선 계좌 없는 항목도 어느 통장 납부든 자기 것이 된다.
+  //   ★단 상대가 **본 매칭 한 건으로 이미 다 냈고 수기 입력이 없으면** 이번 달 몫은 끝났으니 다투지 않는다 — 안 그러면
+  //   같은 통장의 다른 명의가 완납한 달마다 정상 선결제가 빠져, 통장에서 이미 나간 돈을 미지급으로 또 뺀다.
+  //   수기 출금금액이 있는 상대는 어느 거래를 썼는지 모르므로 다투는 것으로 본다.
+  const settled = (j: OutItem) => {
+    const own = paidThisMonth.get(j.key);
+    return j.paidOverride == null && own != null && cardBillShortfall(j, own.amount) === 0;
+  };
+  const contested = (i: OutItem, t: ActualOutflow) =>
+    billItems.some(
+      (j) => j.key !== i.key && !settled(j) && (j.accountId == null || accOf(t) === j.accountId) && issuerHit(j, t),
+    );
+  // ★대출에 연결된(loan_id) 납부는 카드론 상환이지 카드대금이 아니다 — 상호·계좌가 같아도 카드대금에 더하지 않는다.
+  const billOf = (i: OutItem, t: ActualOutflow) =>
+    t.type === "payment" && !t.loan_id && issuerHit(i, t) && accOk(i, t);
+  // 금액 큰 항목부터 — 본 매칭과 같은 순서 규칙.
+  // 청구액을 확정한 항목만(cardBillShortfall 과 같은 이유 — 추정액으론 '덜 냈다'를 알 수 없다).
+  for (const i of billItems.filter((x) => x.amountOverridden).sort((a, b) => b.amount - a.amount)) {
+    const own = paidThisMonth.get(i.key);
+    if (own && own.type !== "payment") continue; // payment 아닌 거래로 이미 잡힌 항목은 종전대로
+    // 본 매칭 한 건으로 이미 다 낸 달엔 더하지 않는다 — 같은 카드사 월초 소액 납부가 완납한 대금에 얹혀 출금금액이 부풀지 않게.
+    if (own && cardBillShortfall(i, own.amount) === 0) continue;
+    // 지난달 '그 달 몫' 납부가 있었나 — 지난달 예정일 무렵(예정일 − EARLY_DAY_TOLERANCE 이후) 나간 것만 센다.
+    //   ★월초 납부까지 세면, 월말 예정 카드가 매달 다음 달 초로 밀리는 패턴에서 이 확인이 매달 통과해
+    //   다음 달 초에 나간 지난달 몫이 이번 달 선결제로 흡수된다.
+    const dueFrom = (i.naturalDay ?? i.day ?? 1) - EARLY_DAY_TOLERANCE;
+    const paidLastMonth = prevMonthOutflows.some((t) => billOf(i, t) && Number(t.txn_date.slice(8, 10)) >= dueFrom);
+    const extras = monthOutflows.filter(
+      (t) => !used.has(t) && billOf(i, t) && !contested(i, t) && (paidLastMonth || Number(t.txn_date.slice(8, 10)) > EARLY_DAY_TOLERANCE),
+    );
+    // ★확정액을 넘지 않는 만큼만, 큰 금액부터 채운다 — 넘치는 납부는 이 항목 몫이 아니다.
+    //   · 선결제 뒤 카드앱의 '남은 청구액'을 확정액으로 넣으면 선결제가 혼자 확정액을 넘는다 → 안 붙이고 종전대로 둔다.
+    //     붙이면 '완납'이 되어 예정일에 나갈 남은 청구액이 미지급에서 사라진다.
+    //   · 넘친다고 **전부** 버리면 안 된다 — 선결제+잔액으로 완납한 달에 같은 카드사 소액 납부가 하나만 섞여도
+    //     정상 선결제까지 버려져 이미 나간 돈이 미지급으로 살아난다.
+    const tol = Math.max(1000, i.amount * 0.005);
+    let sum = own?.amount ?? 0;
+    const take: ActualOutflow[] = [];
+    for (const t of [...extras].sort((a, b) => b.amount - a.amount)) {
+      if (sum + t.amount - i.amount <= tol) {
+        take.push(t);
+        sum += t.amount;
+      }
+    }
+    if (take.length === 0) continue;
+    for (const t of take) used.add(t);
+    out.set(i.key, own ? [own, ...take] : take);
+  }
+  return out;
 }
 
 /**
@@ -96,7 +215,7 @@ export interface ClassifiedItem extends OutItem {
  *   같은 금액 경쟁에서 계좌일치 우선패스(pass 36)가 대출 몫의 거래를 가로채지 않게 하는 근거.
  */
 export function toOutflowMatchItem(
-  item: Pick<OutItem, "key" | "sourceKind" | "amount" | "label" | "day" | "accountId"> & { categoryId?: string | null },
+  item: Pick<OutItem, "key" | "sourceKind" | "sourceId" | "amount" | "label" | "day" | "accountId"> & { categoryId?: string | null },
   /** 변동금액 카테고리 id(설계 229) — 안 주면 종전 동작. */
   flexCategoryIds?: ReadonlySet<string>,
 ) {
@@ -111,6 +230,8 @@ export function toOutflowMatchItem(
     day: item.day,
     accountId: item.sourceKind === "loan" ? null : item.accountId,
     accountBlind: item.sourceKind === "loan",
+    // 장부 거래의 loan_id 와 대조하는 0패스용(설계 216).
+    loanId: item.sourceKind === "loan" ? item.sourceId : null,
   };
 }
 
@@ -143,6 +264,17 @@ export interface NextOutItem {
   inForecast: boolean;
 }
 
+/**
+ * 시작월이 당월이거나 그 뒤인 신규 정기지출인가 — 아직 '최근 3개월 실적'이 생길 수 없는 항목. (설계 215)
+ * ★시작월 **당월도** 포함한다: 미래 시작만 면제하면 시작월이 당월이 되는 순간 첫 출금 전까지
+ *   no-recent 로 떨어져 당월·익월·여러 달 예측에서 통째로 사라진다.
+ *   시작월이 지나고도 실적이 없으면 그때부터는 기존 no-recent 규칙을 그대로 받는다.
+ * 대출·할부에는 각자의 기간 규칙이 있으므로 이 예외를 넓히지 않는다.
+ */
+function isNewScheduledOutflow(item: HhScheduledPayment, month: string): boolean {
+  return item.is_active && item.direction === "out" && item.start_date != null && ymOf(item.start_date) >= month;
+}
+
 // 익월 항목 1건 생성. 캘린더에서 온 항목과 카드 이월 항목이 같은 규칙을 타도록 공용화. (설계 81 §C·§D)
 function buildNextItem(
   base: {
@@ -161,6 +293,7 @@ function buildNextItem(
     nextOverrideMap: Map<string, HhCashflowOverride>;
     classifiedByKey: Map<string, ClassifiedItem>;
     paidRecently: Map<string, ActualOutflow>;
+    newScheduledIds: Set<string>;
     methodResolver?: MethodResolver;
   }
 ): NextOutItem {
@@ -174,7 +307,8 @@ function buildNextItem(
   // 당월 출금금액이 0/비움이면 '미출금'이라는 뜻이지(설계 65) '익월에 0원 나간다'는 뜻이 아니다.
   // → 실적으로 보지 않고 당월 예상금액으로 넘어간다.
   const rawPaid = cur?.paidAmount ?? null;
-  const currentPaid = rawPaid != null && rawPaid > 0 ? rawPaid : null;
+  // ★부분 납부(설계 218)는 실적이 아니다 — 낸 합계를 익월 기준으로 쓰면 익월 카드대금이 과소추정된다 → 당월 예상금액.
+  const currentPaid = rawPaid != null && rawPaid > 0 && !cur?.paidPartial ? rawPaid : null;
   const currentAmount = cur?.amount ?? null;
   // 이월 기준값: 당월 출금금액 > 당월 예상금액 > 원본 금액. (요구 사항 2026-07-17)
   const baseAmount = currentPaid ?? currentAmount ?? base.fallbackAmount;
@@ -197,12 +331,15 @@ function buildNextItem(
   //   익월만 지갑으로 지정하면 reason=no-recent · inForecast=false · nextForecastOut=0 이 됐다).
   const methodOverridden =
     ov?.payment_method_id != null && (base.sourceKind === "fixed" || base.sourceKind === "installment");
+  // 시작월이 당월 이후라 실적·활성 이력이 없는 것이 정상인 신규 정기지출은 시작월부터 예정으로 둔다. (설계 215)
+  const newScheduled =
+    base.sourceKind === "fixed" && ctx.newScheduledIds.has(base.sourceId);
   let reason: ReleaseReason = null;
   if (released) reason = "manual";
   else if (day == null) reason = "undated";
   // 카드 결제분은 은행 실출금이 없어 최근 실적이 영원히 안 잡힌다 → 당월과 같은 면제. (설계 108 교차리뷰)
   // 없으면 새로 등록한 카드결제 고정비가 익월 탭에서 통째로 사라진다.
-  else if (!paidRecently && !dayOverridden && !wasActiveThisMonth && !eff.cardCharge && !methodOverridden)
+  else if (!paidRecently && !dayOverridden && !wasActiveThisMonth && !eff.cardCharge && !methodOverridden && !newScheduled)
     reason = "no-recent";
 
   return {
@@ -227,7 +364,7 @@ function buildNextItem(
     reason,
     // 설계 65 §F + 당월 예정 이월(요구 사항 2026-07-18): 당월 예정이면 익월 예측에도 포함해 익월 탭↔예측 정합을 유지한다.
     // 표(reason)와 예측(inForecast)이 같은 신호를 봐야 두 숫자가 안 갈린다(설계 65 §F + 설계 203).
-    inForecast: !released && (paidRecently || dayOverridden || wasActiveThisMonth || methodOverridden),
+    inForecast: !released && (paidRecently || dayOverridden || wasActiveThisMonth || methodOverridden || newScheduled),
   };
 }
 
@@ -283,6 +420,7 @@ export function buildOutItem(
     naturalDay: day,
     dayOverridden: ov?.day_override != null,
     amount: ov?.amount_override ?? entry.amount,
+    amountOverridden: ov?.amount_override != null,
     // 카드 결제분은 계좌에서 안 빠지므로 계좌를 갖지 않는다. 과거에 지정해 둔 오버라이드 계좌가 남아 있으면
     // 그 계좌가 '출금 후 잔액' 합계 범위(scopeAccIds)에 끼어 잔액이 부풀므로 여기서 정규화한다. (설계 108 교차리뷰)
     accountId: eff.cardCharge ? null : ov?.account_id ?? eff.defaultAccountId,
@@ -306,6 +444,18 @@ export function buildOutItem(
  * ★상호까지 일치하는 짝은 이 가드를 면제받는다(matchOutflowActuals 참고).
  */
 export const EARLY_DAY_TOLERANCE = 5;
+
+/** 대상 월이 오늘이 속한 달이면 오늘 일자, 아니면 undefined(설계 212 — 과거·미래 달엔 걸지 않는다). */
+export function todayDayIn(month: string, today?: string): number | undefined {
+  if (!today || today.slice(0, 7) !== month) return undefined;
+  const d = Number(today.slice(8, 10));
+  if (!Number.isFinite(d)) return undefined;
+  // 말일이면 31 — 카드 청구일(billing_day)은 월말로 맞춰지지 않아 30일 달의 31일 항목이
+  // 말일에도 '예정일 전'으로 남는다. 말일엔 모든 항목이 도래한 것으로 본다.
+  const [y, m] = month.split("-").map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return d >= last ? 31 : d;
+}
 
 export interface CashMatchOutflow extends ActualOutflow {
   type: "expense" | "payment" | "transfer";
@@ -332,6 +482,8 @@ export function computeCashMatches(input: {
   recentOutflows: CashMatchOutflow[];
   accounts: { id: string }[];
   methods: { id: string; kind: string }[];
+  /** 오늘(KST). 당월 카드 결제분 표시에도 설계 212 를 건다. 안 주면 종전 동작. */
+  today?: string;
   /** 변동금액 카테고리 id(설계 229, `variableAmountCategoryIds`). 스냅샷에 넘긴 값과 같아야 한다. */
   variableAmountCategoryIds?: string[];
 }) {
@@ -394,7 +546,7 @@ export function computeCashMatches(input: {
   const prevPool = [...cardTxnOf(prevYm), ...prevOutflowPool.filter((t) => t.type !== "payment" && !usedPrev.has(t))];
   return {
     prevPaidByKey,
-    cardPaidByKey: matchOutflowActuals(nowCardItems, nowPool, { earlyDayTolerance: EARLY_DAY_TOLERANCE }),
+    cardPaidByKey: matchOutflowActuals(nowCardItems, nowPool, { earlyDayTolerance: EARLY_DAY_TOLERANCE, todayDay: todayDayIn(month, input.today) }),
     prevCardPaidByKey: matchOutflowActuals(prevCardItems, prevPool, { earlyDayTolerance: EARLY_DAY_TOLERANCE }),
   };
 }
@@ -429,6 +581,11 @@ export interface CashflowSnapshotInput {
   totalCash: number;
   /** 예측 개월 수(3/6/12). */
   horizon: number;
+  /**
+   * 오늘(KST, YYYY-MM-DD). 대상 월이 이번 달이면 **예정일이 안 온 항목은 상호까지 맞는 거래만** '출금됨'으로
+   * 본다(설계 212). 안 주면 종전 동작(과거 달·검증 스크립트 호환).
+   */
+  today?: string;
   /**
    * 변동 지출(생활비) 보정. (설계 173)
    * 예정에는 고정비·대출·할부·카드대금만 들어가 **레저·외식·생필품 같은 변동 지출이 통째로 빠진다**
@@ -498,10 +655,16 @@ export function cashflowSnapshot(month: string, input: CashflowSnapshotInput): C
   const overrideMap = new Map<string, HhCashflowOverride>();
   for (const o of input.overrides) overrideMap.set(`${o.source_kind}:${o.source_id}`, o);
 
+  // 대출 예정금액은 직전 실제 상환액으로(설계 219). 원장(input.loans)은 그대로 두고 금액만 바꾼 사본을 쓴다.
+  //   curLoans(앞선 달 기준) — 당월 표. 익월 항목은 이 값 위에서 buildNextItem 이 '당월 매칭 실지급 > 당월 예정' 순으로 정한다.
+  //   aheadLoans(당월 포함 기준) — 당월에 없던 익월 항목의 fallback 과 셋째 달부터의 예측(forecastLoans).
+  const curLoans = effectiveLoanPayments(input.loans, input.recentOutflows, shiftMonth(month, -1), input.scheduled);
+  const aheadLoans = effectiveLoanPayments(input.loans, input.recentOutflows, month, input.scheduled);
+
   // 당월 출금 예정 — 고정비·대출·할부·신용카드 대금. (소비 거래는 섞지 않음)
   const cal = cashflowCalendar(month, {
     scheduled: input.scheduled,
-    loans: input.loans,
+    loans: curLoans,
     installments: input.installments,
     txns: input.txns,
     methods: input.methods,
@@ -581,14 +744,25 @@ export function cashflowSnapshot(month: string, input: CashflowSnapshotInput): C
     // ★계좌도 **등록값**으로 넘긴다 — 오버라이드가 적용된 accountId 를 넘기면 설계 188 의 계좌
     //   우선순위가 달라져 과거 실적의 주인이 바뀐다(교차검토 High).
     .map((i) => toOutflowMatchItem({ ...i, accountId: i.baseAccountId }, flexIds));
-  const paidThisMonth = matchOutflowActuals(monthMatchItems, monthOutflows, { earlyDayTolerance: EARLY_DAY_TOLERANCE });
+  const paidThisMonth = matchOutflowActuals(monthMatchItems, monthOutflows, { earlyDayTolerance: EARLY_DAY_TOLERANCE, todayDay: todayDayIn(month, input.today) });
   const paidRecently = matchOutflowActuals(recentMatchItems, pool);
+  // 카드대금 선결제·부분 납부(설계 218) — 본 매칭이 못 붙인 같은 카드사 납부를 합산한다.
+  const cardBillPays = cardBillPaymentsByKey(outItems, monthOutflows, pool.filter((t) => ymOf(t.txn_date) === shiftMonth(month, -1)), paidThisMonth);
 
   // 재분류: 예정(reason=null) / 제외(사유). 날짜 미정·최근 3개월 실적 없음은 제외로.
   // 단 날짜를 직접 지정(day_override)했으면 확정으로 보고 예정 유지.
+  // 시작월이 당월 이후인 신규 정기지출 — 당월·익월 분류와 예측이 같은 집합을 본다. (설계 215)
+  const newScheduledIds = new Set(input.scheduled.filter((s) => isNewScheduledOutflow(s, month)).map((s) => s.id));
+  const isNewScheduled = (i: { sourceKind: string; sourceId: string }) => i.sourceKind === "fixed" && newScheduledIds.has(i.sourceId);
   const classified: ClassifiedItem[] = outItems.map((i) => {
-    const paidAmount = i.paidOverride ?? paidThisMonth.get(i.key)?.amount ?? null;
-    const recently = paidRecently.has(i.key);
+    const bills = cardBillPays.get(i.key);
+    const autoPaid = bills ? bills.reduce((s, t) => s + t.amount, 0) : paidThisMonth.get(i.key)?.amount ?? null;
+    const paidAmount = i.paidOverride ?? autoPaid ?? null;
+    // 부분 납부는 카드대금만(설계 218). 수기 출금금액(paid_override)도 같은 뜻 — 0/비움은 미출금(설계 65 2차) 그대로.
+    const shortfall = paidAmount && isCardBillItem(i) ? cardBillShortfall(i, paidAmount) : 0;
+    const remainingAmount = !paidAmount ? i.amount : shortfall;
+    // 시작월이 당월인 신규 항목은 실적이 없는 게 정상이다 → no-recent 면제. (설계 215)
+    const recently = paidRecently.has(i.key) || isNewScheduled(i);
     let reason: ReleaseReason = null;
     if (i.released) reason = "manual";
     else if (i.day == null) reason = "undated";
@@ -598,7 +772,7 @@ export function cashflowSnapshot(month: string, input: CashflowSnapshotInput): C
     //   바꾸는 순간 `!cardCharge` 면제가 풀려 **그 행이 표에서 통째로 사라진다**(교차리뷰 High H1).
     //   게다가 사라진 행이 가는 '보류 > 확인필요' 탭에는 결제방식 열이 없어 되돌릴 수도 없다.
     else if (!recently && !i.dayOverridden && !i.cardCharge && !i.methodOverridden) reason = "no-recent";
-    return { ...i, paidAmount, reason };
+    return { ...i, paidAmount, remainingAmount, paidPartial: shortfall > 0, reason };
   });
   const activeItems = classified.filter((i) => i.reason == null);
   const releasedItems = classified.filter((i) => i.reason != null);
@@ -609,7 +783,8 @@ export function cashflowSnapshot(month: string, input: CashflowSnapshotInput): C
   // ★카드로 결제되는 고정비는 **통장에서 그날 나가지 않는다** → 현금 유출 합계에서 뺀다.
   //   실제 현금은 카드대금일에 '카드대금' 정기지출로 한 번 나가므로 같이 세면 이중계상이다. (설계 108)
   const cashOutItems = activeItems.filter((i) => !i.cardCharge);
-  const pendingOutAll = cashOutItems.filter((i) => !i.paidAmount).reduce((s, i) => s + i.amount, 0);
+  // 부분 납부한 카드대금은 남은 금액만 미지급이다(설계 218) — remainingAmount 가 미출금·완납·부분을 한 값으로 말한다.
+  const pendingOutAll = cashOutItems.reduce((s, i) => s + i.remainingAmount, 0);
   const paidOutAll = cashOutItems.filter((i) => i.paidAmount).reduce((s, i) => s + (i.paidAmount ?? 0), 0);
 
   // ── 익월 출금 (설계 81) ──────────────────────────────────────────
@@ -617,13 +792,13 @@ export function cashflowSnapshot(month: string, input: CashflowSnapshotInput): C
   const nextOverrideMap = new Map<string, HhCashflowOverride>();
   for (const o of input.nextOverrides ?? []) nextOverrideMap.set(`${o.source_kind}:${o.source_id}`, o);
   const classifiedByKey = new Map(classified.map((i) => [i.key, i]));
-  const nextCtx = { nextOverrideMap, classifiedByKey, paidRecently, methodResolver };
+  const nextCtx = { nextOverrideMap, classifiedByKey, paidRecently, newScheduledIds, methodResolver };
 
   // 익월 캘린더 — 고정비·대출·할부. 할부 종료·대출 만기가 반영되므로 '익월에 실제 있는 항목'의 기준이 된다.
   // txns: [] 인 이유 — monthlyCashflow 는 txns 를 안 쓰고, 카드만 txns 를 쓰는데 카드는 아래에서 이월로 만든다.
   const nextCal = cashflowCalendar(nextMonth, {
     scheduled: input.scheduled,
-    loans: input.loans,
+    loans: aheadLoans,
     installments: input.installments,
     txns: [],
     methods: input.methods,
@@ -695,8 +870,9 @@ export function cashflowSnapshot(month: string, input: CashflowSnapshotInput): C
   const currentForecastOut = classified
     // 그 달 결제수단을 지정한 항목은 paidRecently(=base 기준)에 안 잡힐 수 있다 — 사람이 "이 달은
     // 현금으로 낸다"고 못 박았으므로 day_override 와 같이 취급해 당월 예측에 넣는다. (설계 203)
-    .filter((i) => !i.released && !i.cardCharge && !i.paidAmount && (paidRecently.has(i.key) || i.dayOverridden || i.methodOverridden))
-    .reduce((s, i) => s + i.amount, 0);
+    // 시작월이 당월인 신규 정기지출도 실적이 없을 뿐 이번 달에 나갈 돈이다. (설계 215)
+    .filter((i) => !i.released && !i.cardCharge && i.remainingAmount > 0 && (paidRecently.has(i.key) || i.dayOverridden || i.methodOverridden || isNewScheduled(i)))
+    .reduce((s, i) => s + i.remainingAmount, 0); // 부분 납부는 남은 금액만 아직 나갈 돈이다(설계 218)
 
   // 변동 지출(생활비) 보정. (설계 173) 안 넘기면 0 = 기존 동작 그대로.
   // ★첫 달은 **남은 일수 비례분**만 쓴다 — 호출부가 이미 비례 계산해서 넘긴다(firstMonth).
@@ -712,11 +888,18 @@ export function cashflowSnapshot(month: string, input: CashflowSnapshotInput): C
   // ★`baseCardCharge`(항목 등록값)로 판정한다 — 그 달만인 결제수단 오버라이드가 m+2 이후 예측을
   //   좌우하면 안 된다(설계 203, 교차리뷰 High H2). paidRecently 도 같은 이유로 base 기준이다.
   for (const i of classified) if ((paidRecently.has(i.key) || i.dayOverridden) && !i.baseCardCharge) forecastSourceIds.add(i.sourceId);
+  // 시작월이 당월 이후인 신규 정기지출도 예측 소속에 넣어야 시작월부터 나타난다(실적이 없어 위 루프에 안 걸린다). (설계 215)
+  // 등록값이 카드 결제면 카드대금과 이중계상되므로 기존 baseCardCharge 규칙과 똑같이 제외한다.
+  for (const s of input.scheduled) {
+    if (isNewScheduledOutflow(s, month) && !methodResolver.isCardCharge(s.payment_method_id)) {
+      forecastSourceIds.add(s.id);
+    }
+  }
 
   const hasScheduledIncome = input.scheduled.some((s) => s.is_active && s.direction === "in" && (s.amount ?? 0) > 0);
   // 수입(in)은 전부, 지출(out)은 예측 소스 집합만. 대출·할부도 동일 필터.
   const forecastScheduled = input.scheduled.filter((s) => s.direction === "in" || forecastSourceIds.has(s.id));
-  const forecastLoans = input.loans.filter((l) => forecastSourceIds.has(l.id));
+  const forecastLoans = aheadLoans.filter((l) => forecastSourceIds.has(l.id));
   const forecastInstallments = input.installments.filter((i) => forecastSourceIds.has(i.id));
   // 당월 이미 입금된 정기수입은 첫 달 예상수입에서 제외(이중계상 방지, 설계 65 수입 대칭).
   const receivedInflow = receivedInflowIds(month, forecastScheduled, input.txns);

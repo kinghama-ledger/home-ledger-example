@@ -6,6 +6,7 @@ import { useMemo, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { DateField } from "@/components/form/date-field";
+import { usePrivacyMode } from "@/components/privacy/privacy-mode";
 import { cn } from "@/lib/utils";
 import { presetRange, type RangePreset } from "@/lib/household/month";
 
@@ -150,7 +151,10 @@ export function HhSearchBar({
       // 이미 고른 항목은 감춤 대상이어도 남긴다 — 안 그러면 선택값이 목록에서 사라져 빈칸으로 보인다.
       (o) => includeInactive || o.isActive !== false || o.id === selectedId
     );
-  const optLabel = (o: HhFilterOption) => (o.isActive === false ? `${o.name} (비활성)` : o.name);
+  // 가림 모드에서는 계좌·카드 이름 속 명의(괄호 안 이름)도 가린다 — 목록은 가려지는데 고르는 칸에만 남지 않게.
+  const { mask } = usePrivacyMode();
+  const ownerMasked = (name: string) => mask("owner_name", name);
+  const optLabel = (o: HhFilterOption) => (o.isActive === false ? `${ownerMasked(o.name)} (비활성)` : ownerMasked(o.name));
   const inactiveCount =
     (advanced?.methods?.filter((m) => m.isActive === false).length ?? 0) +
     (advanced?.accounts?.filter((a) => a.isActive === false).length ?? 0);
@@ -287,7 +291,7 @@ export function HhSearchBar({
                     {cardGroups.length > 0 ? (
                       <optgroup label="카드 묶음 (카드사·명의)">
                         {cardGroups.map((g) => (
-                          <option key={g.key} value={`grp:${g.key}`}>{g.key} 전체 ({g.ids.length}장)</option>
+                          <option key={g.key} value={`grp:${g.key}`}>{ownerMasked(g.key)} 전체 ({g.ids.length}장)</option>
                         ))}
                       </optgroup>
                     ) : null}
@@ -307,7 +311,7 @@ export function HhSearchBar({
                     {cardGroups.length > 0 ? (
                       <optgroup label="카드 묶음 (카드사·명의)">
                         {cardGroups.map((g) => (
-                          <option key={g.key} value={`grp:${g.key}`}>{g.key} 전체 ({g.ids.length}장)</option>
+                          <option key={g.key} value={`grp:${g.key}`}>{ownerMasked(g.key)} 전체 ({g.ids.length}장)</option>
                         ))}
                       </optgroup>
                     ) : null}

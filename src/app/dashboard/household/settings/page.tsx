@@ -31,6 +31,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { HH_TAB_SOLID } from "@/components/household/hh-tab-styles";
 import { reportEvent } from "@/lib/audit/client";
 import { browserDb } from "@/lib/backend/browser";
+import { maskNamesIn } from "@/lib/privacy/mask";
 import { cn } from "@/lib/utils";
 import {
   DEFAULT_ACCOUNTS,
@@ -57,6 +58,15 @@ import {
 
 type IngestToken = { id: string; label: string | null; last_used_at: string | null; created_at: string };
 
+// 토큰 표의 시각 표시 — "2026-01-05 09:30" 처럼 길이가 고정된 꼴(발급일은 앞 10자만 쓴다).
+// toLocaleString("ko-KR") 은 달·시·오전/오후에 따라 길이가 달라져, 두 자리 달이 되면 칸이 두 줄로 꺾인다.
+function formatStamp(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso; // 못 읽는 값은 원문 그대로 보여 이상을 숨기지 않는다
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 // 문자수집 토큰: 클라이언트에서 안전 난수 생성 후 sha256 해시만 DB에 저장(원문은 1회만 표시).
 function randomToken(): string {
   const a = new Uint8Array(24);
@@ -80,8 +90,11 @@ async function copyText(value: string | (() => string), done = "복사했습니�
 
 export default function HouseholdSettingsPage() {
   const supabase = useMemo(() => browserDb(), []);
-  const { mask } = usePrivacyMode();
+  const { mask, enabled: privacyOn } = usePrivacyMode();
   const [persons, setPersons] = useState<HhPerson[]>([]);
+  // 사용자가 지은 이름(정기지출 제목·토큰 이름) 안의 등록 인물 이름을 가린다 — 현금흐름 화면과 같은 규칙.
+  const personNames = useMemo(() => persons.map((p) => p.name), [persons]);
+  const maskNames = (text: string | null | undefined) => maskNamesIn(text, personNames, privacyOn);
   const [accounts, setAccounts] = useState<HhAccount[]>([]);
   const [categories, setCategories] = useState<HhCategory[]>([]);
   const [methods, setMethods] = useState<HhPaymentMethod[]>([]);
@@ -260,6 +273,11 @@ export default function HouseholdSettingsPage() {
   // 삭제 → 연결된 거래가 있으면(FK RESTRICT) 데이터 손실 없이 '보관(숨김)'을 제안.
   // 보관 = is_active=false. 신규 입력 드롭다운에서 숨겨지되 과거 거래·통계는 그대로 유지된다.
   const deleteRow = async (table: string, id: string, label: string) => {
+    // 가림 모드에서는 삭제하지 않는다 — 확인창에 실제 이름이 그대로 나온다(상세 화면과 같은 방식).
+    if (privacyOn) {
+      toast.info("마스킹 모드에서는 삭제할 수 없습니다");
+      return;
+    }
     if (!confirm(`'${label}' 항목을 삭제하시겠습니까?`)) return;
     const { error: err } = await supabase.from(table).delete().eq("id", id);
     if (!err) {
@@ -338,6 +356,10 @@ export default function HouseholdSettingsPage() {
   };
 
   const revokeToken = async (id: string, label: string | null) => {
+    if (privacyOn) {
+      toast.info("마스킹 모드에서는 폐기할 수 없습니다");
+      return;
+    }
     if (!confirm(`'${label ?? "토큰"}'을(를) 폐기하시겠습니까? 이 토큰을 쓰던 폰은 더 이상 문자를 보낼 수 없습니다.`)) return;
     const { error: err } = await supabase.from("hh_ingest_token").delete().eq("id", id);
     if (err) {
@@ -538,7 +560,7 @@ export default function HouseholdSettingsPage() {
         <td className={cn(TD, "text-muted-foreground")}>{a.bank ?? "-"}</td>
         <td className={cn(TD, "whitespace-nowrap")}>{mask("name", personName(a.person_id))}</td>
         <td className={cn(TD, "whitespace-nowrap")}>{ACCOUNT_KIND_LABEL[a.kind]}</td>
-        <td className={cn(TD, HH_CELL.wrapText, "tabular-nums")} title={maskAccountNo(a.account_no)}>{maskAccountNo(a.account_no)}</td>
+        <td className={cn(TD, HH_CELL.wrapText, "tabular-nums")} title={mask("account_no", maskAccountNo(a.account_no))}>{mask("account_no", maskAccountNo(a.account_no))}</td>
         <td className={TD}>
           {linked && linked.is_active ? (
             <div className="flex items-center gap-1.5">
@@ -578,7 +600,7 @@ export default function HouseholdSettingsPage() {
       <td className={cn(TD, "text-muted-foreground")}>-</td>
       <td className={cn(TD, "whitespace-nowrap")}>{mask("name", personName(m.person_id))}</td>
       <td className={cn(TD, "whitespace-nowrap")}>{PAYMENT_METHOD_KIND_LABEL[m.kind]}</td>
-      <td className={cn(TD, HH_CELL.wrapText, "tabular-nums")} title={m.kind === "cash" ? "-" : maskCardNo(m.card_no)}>{m.kind === "cash" ? "-" : maskCardNo(m.card_no)}</td>
+      <td className={cn(TD, HH_CELL.wrapText, "tabular-nums")} title={m.kind === "cash" ? "-" : mask("account_no", maskCardNo(m.card_no))}>{m.kind === "cash" ? "-" : mask("account_no", maskCardNo(m.card_no))}</td>
       <td className={TD}>
         <Badge variant="secondary">{PAYMENT_METHOD_KIND_LABEL[m.kind]}</Badge>
       </td>
@@ -675,7 +697,10 @@ export default function HouseholdSettingsPage() {
             <SimpleTable
               head={[
                 // 열 폭 = 내용별(설계 122). 괄호 안은 실측 필요폭(measure_table_content.mts — 이 예제에는 없음).
-                { label: "이름", width: HH_COL.x4wide },               // 가장 긴 카드명(235)까지 한 줄에 — 표 합계 1192 로 1200 이내(설계 125)
+                // 이름 — 사람이 짓는 이름의 주력 슬롯 xxwide(208, 안쪽 176 = 한글 16자쯤). 넘는 이름은 줄을 바꾼다(칸에 wrapText).
+                // 예전엔 가장 긴 카드명 하나(235px)에 맞춰 x4wide(272)였는데, '은행(이름)' 꼴의 보통 이름(92px)만 있으면
+                // 이 열에만 150px 이 비어 열 간격 검사(A')에 걸렸다(실측 2026-11-12, 가상 자료). 표 합계 1192 → 1128.
+                { label: "이름", width: HH_COL.xxwide },
                 { label: "은행/카드사", width: HH_COL.standard },      // 82.8 (헤더 52.8)
                 { label: "명의", width: HH_COL.short },                // 61.1
                 { label: "종류", width: HH_COL.short },                // 71.5
@@ -790,7 +815,7 @@ export default function HouseholdSettingsPage() {
             >
               {scheduled.map((sp) => (
                 <tr key={sp.id} className={ROW}>
-                  <td className={cn(TD, "font-medium")}>{sp.title}</td>
+                  <td className={cn(TD, "font-medium")}>{maskNames(sp.title)}</td>
                   <td className={TD}>{SCHEDULED_KIND_LABEL[sp.kind]}</td>
                   <td className={TD}>{sp.direction === "in" ? <Badge variant="secondary">수입</Badge> : <Badge variant="secondary">지출</Badge>}</td>
                   <td className={cn(TD, "truncate text-right tabular-nums")}>{sp.amount != null ? mask("expense_amount", `${sp.amount.toLocaleString("ko-KR")}원`) : "-"}</td>
@@ -850,15 +875,15 @@ export default function HouseholdSettingsPage() {
             <SimpleTable head={[
               // 열 폭 = 내용별(설계 122). 괄호 안은 실측 필요폭.
               { label: "이름", width: HH_COL.standard },  // 106.7
-              { label: "마지막 사용" },                    // 157.2 — 날짜+시각이라 가장 길다(가변)
-              { label: "발급일", width: HH_COL.standard }, // 94.3
+              { label: "마지막 사용" },                    // 고정 16자 "YYYY-MM-DD HH:mm"(formatStamp) — 기준폭 160 안에 한 줄
+              { label: "발급일", width: HH_COL.standard }, // 고정 10자 "YYYY-MM-DD"(formatStamp 앞 10자)
               { label: "", width: HH_COL.short },          // 폐기 아이콘
             ]}>
               {tokens.map((t) => (
                 <tr key={t.id} className={ROW}>
-                  <td className={cn(TD, "font-medium")}>{t.label ?? "(이름없음)"}</td>
-                  <td className={cn(TD, "text-muted-foreground")}>{t.last_used_at ? new Date(t.last_used_at).toLocaleString("ko-KR") : "미사용"}</td>
-                  <td className={cn(TD, "text-muted-foreground")}>{new Date(t.created_at).toLocaleDateString("ko-KR")}</td>
+                  <td className={cn(TD, "font-medium")}>{t.label ? maskNames(t.label) : "(이름없음)"}</td>
+                  <td className={cn(TD, "text-muted-foreground")}>{t.last_used_at ? formatStamp(t.last_used_at) : "미사용"}</td>
+                  <td className={cn(TD, "text-muted-foreground")}>{formatStamp(t.created_at).slice(0, 10)}</td>
                   <td className={TD}>
                     <div className="flex justify-end">
                       <Button variant="ghost" size="sm" title="폐기" onClick={() => void revokeToken(t.id, t.label)}>

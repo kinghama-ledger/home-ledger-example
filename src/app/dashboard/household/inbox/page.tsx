@@ -339,6 +339,8 @@ export default function HouseholdInboxPage() {
   const [error, setError] = useState(false);
   const [cardBillDoneCheck, setCardBillDoneCheck] = useState<CardBillDoneCheckResult>({ failed: false, unmatched: [] });
   const cardBillDoneCheckRequestSeq = useRef(0);
+  // 건별로 아직 끝나지 않은 인라인 저장(카테고리·계좌·유형·사용내역).
+  const inflightPatches = useRef(new Map<string, Promise<boolean>>());
   const [dialogOpen, setDialogOpen] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
   // 토스 이자 빠른 입력. (설계 172)
@@ -820,7 +822,16 @@ export default function HouseholdInboxPage() {
   // 성공=true. 상태 전이 호출부는 이 반환값을 보고 성공 토스트를 띄운다 — 실패했는데
   // "복원했습니다"가 같이 뜨던 거짓 성공을 막는다(설계 163 교차리뷰 R2. 복원은 동일시각
   // 인덱스에 막힐 수 있는 실제 실패 경로가 생겼다).
-  const patchItem = async (id: string, patch: Partial<HhTransactionInbox>, opts?: { silent?: boolean }): Promise<boolean> => {
+  // 같은 건의 저장은 차례로 보낸다(나중에 고친 값이 먼저 도착해 뒤집히지 않게). 진행 중인 저장은 inflightPatches 에 남겨
+  // 한 건 확정이 끝나기를 기다릴 수 있게 한다.
+  const patchItem = (id: string, patch: Partial<HhTransactionInbox>, opts?: { silent?: boolean }): Promise<boolean> => {
+    const before = inflightPatches.current.get(id) ?? Promise.resolve(true);
+    const mine = before.then(() => runPatch(id, patch, opts), () => runPatch(id, patch, opts));
+    inflightPatches.current.set(id, mine);
+    void mine.finally(() => { if (inflightPatches.current.get(id) === mine) inflightPatches.current.delete(id); });
+    return mine;
+  };
+  const runPatch = async (id: string, patch: Partial<HhTransactionInbox>, opts?: { silent?: boolean }): Promise<boolean> => {
     const { error: err } = await supabase.from("hh_transaction_inbox").update(patch).eq("id", id);
     if (err) {
       toast.error(`수정 실패: ${err.message}`);
@@ -979,6 +990,62 @@ export default function HouseholdInboxPage() {
     }
     reportEvent("CONFIRM_HH_INBOX", `수집함 확정: ${item.guessed_merchant} ${item.guessed_amount}원`, { resource: "hh_transaction", resource_id: txnId as string });
     return null;
+  };
+
+  // 카드 한 건 확정(모바일 카드의 [확정]). 여러 건용 confirmMany 를 쓰지 않는다 —
+  // 그쪽은 실패 사유를 건수로만 알리고, 다른 카드의 체크까지 모두 푼다.
+  const confirmOne = async (shown: HhTransactionInbox, memoInput: string | null) => {
+    // 카테고리·계좌·유형을 고치자마자 [확정]을 누르면 그 저장이 끝나기 전에 확정이 먼저 가서 옛 값으로 거래가 만들어진다.
+    // 진행 중인 저장을 기다린 뒤, 화면에 있던 값이 아니라 DB 의 지금 값을 다시 읽어 그것으로 확정한다.
+    setConfirmingAll(true);
+    await inflightPatches.current.get(shown.id)?.catch(() => false);
+    const { data: freshRow, error: freshErr } = await supabase.from("hh_transaction_inbox").select("*").eq("id", shown.id).single();
+    if (freshErr || !freshRow) {
+      setConfirmingAll(false);
+      return void toast.error("이 건을 다시 읽지 못해 확정하지 않았습니다. 새로고침한 뒤 다시 해 주세요.");
+    }
+    const it = freshRow as HhTransactionInbox;
+    const why = validateItem(it);
+    if (why) {
+      setConfirmingAll(false);
+      return void toast.error(why);
+    }
+    // 승인취소 확정은 원 지출을 지우고 되돌릴 수 없다 — 한 번 누른 것으로 일어나면 안 된다.
+    if (it.guessed_kind === "cancel" && !window.confirm("승인취소 건입니다. 확정하면 원래 지출을 삭제하며 되돌릴 수 없습니다. 계속할까요?")) {
+      setConfirmingAll(false);
+      return;
+    }
+    // 사용내역을 고치다 바로 누르면 입력칸의 blur 저장과 확정이 겹친다 — 확정 전에 먼저 저장한다.
+    // blur 저장도 따로 돌지만 같은 값을 한 번 더 쓰는 것이라 해가 없다. 실패하면 사유를, 성공하면 null 을 돌려준다.
+    const saveMemoThenConfirm = async (): Promise<string | null> => {
+      const memo = memoInput?.trim() ?? null;
+      let target = it;
+      if (memo !== null && memo !== (it.user_memo ?? "")) {
+        if (!(await patchItem(it.id, { user_memo: memo || null }, { silent: true }))) {
+          return "사용내역 저장에 실패해 확정하지 않았습니다.";
+        }
+        target = { ...it, user_memo: memo || null };
+      }
+      const fail = await doConfirm(target);
+      return fail ? `확정 실패: ${fail}` : null;
+    };
+    // (try…finally 를 쓰지 않는다 — 이 컴포넌트의 react-hooks 린트 분석이 통째로 꺼진다.)
+    setConfirmingAll(true);
+    try {
+      const fail = await saveMemoThenConfirm();
+      if (fail) {
+        toast.error(fail);
+      } else {
+        toast.success("확정했습니다.");
+        setSelected((prev) => { const n = new Set(prev); n.delete(it.id); return n; });
+        await fetchData();
+      }
+    } catch (err) {
+      // 확정 뒤 후처리(충전 인센티브·가맹점 학습)에서 예외가 나도 안내 없이 끝나지 않게 한다.
+      toast.error(`확정 처리 중 오류가 났습니다 — 새로고침 후 확정됐는지 확인해 주세요. (${String(err)})`);
+      await fetchData().catch(() => undefined);
+    }
+    setConfirmingAll(false);
   };
 
   // 여러 건 순차 확정(분류 완성건만). label=토스트 머리말.
@@ -1411,7 +1478,37 @@ export default function HouseholdInboxPage() {
                     placeholder="사용내역"
                     title={it.raw_text ?? undefined}
                     onBlur={(e) => saveMemo(it, e.target.value)}
+                    data-memo-id={it.id}
                   />
+                  {/* 카드마다 바로 확정·휴지통 — 체크한 뒤 위쪽 '선택 확정'을 누르는 두 단계를 줄인다.
+                      분류가 덜 됐으면 확정하지 않고 이유를 알려 준다(전체 확정과 같은 validateItem). */}
+                  <div className="flex gap-2 pt-1">
+                    <Button
+                      className="h-11 flex-1"
+                      disabled={confirmingAll}
+                      variant={it.guessed_kind === "cancel" ? "destructive" : "default"}
+                      onClick={() => {
+                        const memoEl = document.querySelector<HTMLInputElement>(`input[data-memo-id="${it.id}"]`);
+                        void confirmOne(it, memoEl ? memoEl.value : null);
+                      }}
+                    >
+                      <CheckCheck className="h-4 w-4" /> {it.guessed_kind === "cancel" ? "취소 반영(복구 불가)" : "확정"}
+                    </Button>
+                    {/* 휴지통은 휴지통 탭에서 복원할 수 있어 묻지 않는다. */}
+                    <Button
+                      variant="outline"
+                      className="h-11"
+                      disabled={confirmingAll}
+                      onClick={async () => {
+                        if (await patchItem(it.id, { status: "ignored" })) {
+                          setSelected((prev) => { const n = new Set(prev); n.delete(it.id); return n; });
+                          toast.success("휴지통으로 보냈습니다.");
+                        }
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" /> 휴지통
+                    </Button>
+                  </div>
                 </div>
               ) : isTrash ? (
                 <div className="flex gap-2">
@@ -1490,6 +1587,10 @@ export default function HouseholdInboxPage() {
         <table
           className="table-fixed text-[0.8rem]"
           style={{ width: tableMinWidth(colWidths) }}
+          // 이 표는 확정 탭에서 합계 1272px 라 1440 화면(껍데기 안쪽 1199)에서도 오른쪽으로 73px 밀어야 보인다.
+          // 새로 생긴 일이 아니라 9열을 한 줄에 담으려던 때부터의 숙제다(merchant-display.ts 머리말 참고).
+          // 숨기지 않고 시험 결과에 이유와 함께 찍히게 한다 — 열을 줄여 1199 안에 넣으면 이 줄을 지운다.
+          data-wide-exempt="알려진 넘침: 확정 탭 9열 합계 1272px 가 상한 1199px 를 넘는다(열을 줄일 때까지)"
           {...(isTrash
             ? { "data-slack-exempt": "휴지통 탭은 값이 부스러기라 열 폭(탭 공유)과 슬랙을 함께 맞출 수 없다" }
             : editable
@@ -1945,7 +2046,7 @@ export default function HouseholdInboxPage() {
                   <Button variant="outline" size="sm" onClick={() => void confirmSelected()} disabled={confirmingAll || selectedPendingCount === 0}>
                     <CheckCheck className="h-4 w-4 text-emerald-600" /> 선택 확정{selectedPendingCount > 0 ? ` (${selectedPendingCount})` : ""}
                   </Button>
-                  <Button variant="outline" size="sm" onClick={() => void trashSelected()} disabled={selectedPendingCount === 0}>
+                  <Button variant="outline" size="sm" onClick={() => void trashSelected()} disabled={confirmingAll || selectedPendingCount === 0}>
                     <Trash2 className="h-4 w-4" /> 선택 비우기
                   </Button>
                   <Button size="sm" onClick={() => void confirmAll()} disabled={confirmingAll}>
@@ -1961,7 +2062,7 @@ export default function HouseholdInboxPage() {
                   <Button variant="outline" size="sm" onClick={() => void unconfirmSelected()} disabled={selectedConfirmedCount === 0}>
                     <Undo2 className="h-4 w-4 text-amber-600" /> 선택 되돌리기{selectedConfirmedCount > 0 ? ` (${selectedConfirmedCount})` : ""}
                   </Button>
-                  <Button variant="outline" size="sm" onClick={() => void archiveSelected()} disabled={selectedConfirmedCount === 0}>
+                  <Button variant="outline" size="sm" onClick={() => void archiveSelected()} disabled={confirmingAll || selectedConfirmedCount === 0}>
                     <Archive className="h-4 w-4" /> 선택 보관{selectedConfirmedCount > 0 ? ` (${selectedConfirmedCount})` : ""}
                   </Button>
                 </>

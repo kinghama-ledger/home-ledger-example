@@ -12,25 +12,34 @@ import { usePrivacyMode } from "@/components/privacy/privacy-mode";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { browserDb } from "@/lib/backend/browser";
+import { maskNamesIn } from "@/lib/privacy/mask";
 import type { HhLoan } from "@/lib/household/types";
 
 export default function HouseholdLoanDetailPage() {
   const supabase = useMemo(() => browserDb(), []);
-  const { mask } = usePrivacyMode();
+  const { mask, enabled: privacyOn } = usePrivacyMode();
   const params = useParams();
   const router = useRouter();
   const id = params.id as string;
 
   const [row, setRow] = useState<HhLoan | null>(null);
+  // 등록된 사람 이름 — 대출명 안의 이름을 가릴 때만 쓴다(목록 화면과 같은 규칙).
+  const [personNames, setPersonNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [deleting, setDeleting] = useState(false);
 
   const fetchOne = useCallback(async () => {
     await supabase.auth.getSession();
-    const { data } = await supabase.from("hh_loan").select("*").eq("id", id).single();
-    setRow((data as HhLoan) ?? null);
+    const [{ data }, personRes] = await Promise.all([
+      supabase.from("hh_loan").select("*").eq("id", id).single(),
+      supabase.from("hh_person").select("name"),
+    ]);
+    // 가림 중에 이름 목록을 못 받으면 대출명 속 이름을 가릴 수 없다 — 실명을 보이느니 '찾을 수 없음'으로 둔다.
+    // 가림이 꺼져 있으면 이름 목록이 없어도 대출은 그대로 보여 준다.
+    setPersonNames(((personRes.data ?? []) as { name: string }[]).map((p) => p.name));
+    setRow(personRes.error && privacyOn ? null : ((data as HhLoan) ?? null));
     setLoading(false);
-  }, [supabase, id]);
+  }, [supabase, id, privacyOn]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -39,6 +48,11 @@ export default function HouseholdLoanDetailPage() {
 
   const handleDelete = async () => {
     if (!row || deleting) return;
+    // 가림 모드에서는 삭제하지 않는다 — 확인창에 실제 값이 그대로 나온다.
+    if (privacyOn) {
+      toast.info("마스킹 모드에서는 삭제할 수 없습니다");
+      return;
+    }
     if (!confirm(`'${row.name}' 대출을 삭제하시겠습니까?`)) return;
     setDeleting(true);
     const { error: err } = await supabase.from("hh_loan").delete().eq("id", id);
@@ -55,13 +69,14 @@ export default function HouseholdLoanDetailPage() {
   if (!row)
     return <FailureNotice title="대출을 찾을 수 없습니다." description="이미 삭제되었거나 접근할 수 없는 내역입니다." action={<Button asChild variant="outline"><Link href="/dashboard/household/loans">목록으로</Link></Button>} />;
 
+  const shownName = maskNamesIn(mask("owner_name", row.name), personNames, privacyOn);
   const repaid = row.principal > 0 ? Math.min(100, Math.round(((row.principal - row.current_balance) / row.principal) * 100)) : 0;
 
   return (
     <Screen>
       <HhPageHeader
-        title={mask("owner_name", row.name)}
-        breadcrumbs={[{ label: "가계부" }, { label: "대출관리", href: "/dashboard/household/loans" }, { label: mask("owner_name", row.name) }]}
+        title={shownName}
+        breadcrumbs={[{ label: "가계부" }, { label: "대출관리", href: "/dashboard/household/loans" }, { label: shownName }]}
         actions={
           <>
             <Button variant="outline" asChild><Link href="/dashboard/household/loans"><ArrowLeft className="h-4 w-4" />목록</Link></Button>

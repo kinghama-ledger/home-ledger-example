@@ -183,7 +183,7 @@ start_date      date
 end_date        date
 created_at, updated_at
 ```
-> 매월 납부일을 1~28 로 묶는 것은 달마다 다른 말일(29~31일)을 피하려는 것이다. 등록·수정 화면은 `src/components/household/scheduled-payment-dialog.tsx`.
+> 매월 납부일은 1~31 이고 31 은 그 달 말일로 계산한다(29·30 도 그 달에 없으면 말일). 검증은 `src/lib/household/pay-day.ts`, 등록·수정 화면은 `src/components/household/scheduled-payment-dialog.tsx`.
 
 ---
 

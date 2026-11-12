@@ -278,9 +278,10 @@ export default function HouseholdExpensesPage() {
   //
   // ⚠️`twoUp` 기능 자체는 HhBoard 에 남겨 뒀다(다른 화면이 쓸 수 있다). 다만 쓰기 전에
   //   **표 폭 ≤ 단 폭**인지 반드시 확인할 것 — `npm run test:table-render` 의 검사 I 가 잡아 준다.
-  const renderTxnTable = (list: HhTransaction[], emptyLabel: string, twoUp = false) => (
+  const renderTxnTable = (list: HhTransaction[], emptyLabel: string, twoUp = false, slackExempt?: string) => (
     <HhBoard<HhTransaction>
       twoUp={twoUp}
+      slackExempt={slackExempt}
       rows={list}
       rowKey={(r) => r.id}
       showCount={false}
@@ -387,7 +388,11 @@ export default function HouseholdExpensesPage() {
               onSelect={toggleCashAccount}
               emptyText="이 기간에 현금/체크 지출이 없습니다."
             />
-            {renderTxnTable(cashRows, "이 기간에 현금/체크 지출이 없습니다.")}
+            {/* 열 폭은 세 탭이 같이 쓴다. 내역·지불방식 열(208)은 긴 상호·카드 이름에 맞춘 폭인데, 이 탭의 지불방식은
+                거의 '현금' 두 글자라 그 열에만 빈자리가 크게 남는다(실측 2026-11-12: 157px, 다른 열은 12~22px).
+                이 탭에 맞춰 좁히면 전체·카드 탭에서 카드 이름이 두 줄로 꺾인다 — 폭으로는 맞출 수 없어
+                열 간격 검사(A')만 뺀다(수집함 휴지통 탭과 같은 사유). 잘림·줄꺾임 검사는 그대로 살아 있다. */}
+            {renderTxnTable(cashRows, "이 기간에 현금/체크 지출이 없습니다.", false, "현금 탭은 지불방식이 거의 '현금' 두 글자라, 긴 카드 이름에 맞춘 열 폭(탭 공유)과 슬랙을 함께 맞출 수 없다")}
           </TabsContent>
           {/* 카드 탭: 옛 '버튼 나열'을 현금 탭과 같은 그래프로 통일. 누르면 그 묶음으로 필터(재클릭 해제). (설계 144) */}
           <TabsContent value="card" className="space-y-3 pt-4">
@@ -432,7 +437,7 @@ export default function HouseholdExpensesPage() {
                 // 전 컬럼 동일 폭(12.5%×8) — 컬럼 시작 위치가 등간격이라 어느 화면 폭에서도 사이 공간이 균일(CLAUDE.md "화면 — 표").
                 { key: "start", header: "시작일", align: "left", width: HH_COL.standard, cell: (ins) => <span className="whitespace-nowrap text-muted-foreground">{ins.start_date}</span> },
                 { key: "cat", header: "카테고리", align: "left", width: HH_COL.standard, cell: (ins) => <Badge variant="secondary">{categoryName(ins.category_id)}</Badge> },
-                { key: "title", header: "내용", align: "left", width: HH_COL.xwide, cell: (ins) => <span className="font-medium text-foreground">{ins.title ?? "-"}</span> },
+                { key: "title", header: "내용", align: "left", width: HH_COL.xwide, cell: (ins) => <span className="font-medium text-foreground">{ins.title ? mask("merchant", ins.title) : "-"}</span> },
                 { key: "progress", header: "진행", align: "left", width: HH_COL.num, cell: (ins) => { const p = installmentProgress(ins, thisMonthKey()); return <span className="whitespace-nowrap text-muted-foreground">{Math.min(Math.max(p.current, 0), ins.total_count)}/{ins.total_count}</span>; } },
                 { key: "end", header: "종료 예정", align: "left", width: HH_COL.short, cell: (ins) => { const endYm = installmentEndYm(ins); return thisMonthKey() > endYm ? <span className="text-muted-foreground/70">완료</span> : <span className="text-muted-foreground">{endYm}</span>; } },
                 { key: "total", header: "전체 결제금액", align: "right", width: HH_COL.standard, cell: (ins) => <span className="whitespace-nowrap tabular-nums text-muted-foreground">{mask("expense_amount", `${ins.total_amount.toLocaleString("ko-KR")}원`)}</span> },

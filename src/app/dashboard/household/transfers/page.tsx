@@ -269,7 +269,7 @@ export default function HouseholdTransfersPage() {
                               ) : null}
                             </span>
                           </td>
-                          <td className="px-4 py-1 text-muted-foreground">{g.rep.memo ?? "-"}</td>
+                          <td className="px-4 py-1 text-muted-foreground">{g.rep.memo ? mask("merchant", g.rep.memo) : "-"}</td>
                         </tr>
                         {isOpen && g.count > 1
                           ? g.items.map((it) => (
@@ -281,7 +281,7 @@ export default function HouseholdTransfersPage() {
                                 <td className="whitespace-nowrap px-4 py-2 pl-8 text-muted-foreground">└ {it.txn_date}</td>
                                 <td className="px-4 py-2 text-muted-foreground">{fromTo(it)}</td>
                                 <td className="whitespace-nowrap px-4 py-2 text-right tabular-nums text-muted-foreground">{mask("amount", won(it.amount))}</td>
-                                <td className="px-4 py-2 text-muted-foreground">{it.memo ?? "-"}</td>
+                                <td className="px-4 py-2 text-muted-foreground">{it.memo ? mask("merchant", it.memo) : "-"}</td>
                               </tr>
                             ))
                           : null}
@@ -311,7 +311,7 @@ export default function HouseholdTransfersPage() {
                         <span className="tabular-nums text-sm font-semibold">{mask("amount", won(g.amount))}</span>
                       </div>
                       <div className="text-sm">{fromTo(g)}</div>
-                      {g.rep.memo ? <div className="text-xs text-muted-foreground">{g.rep.memo}</div> : null}
+                      {g.rep.memo ? <div className="text-xs text-muted-foreground">{mask("merchant", g.rep.memo)}</div> : null}
                     </div>
                     {g.count > 1 ? (
                       <button
@@ -332,7 +332,7 @@ export default function HouseholdTransfersPage() {
                             onClick={() => openEdit(it)}
                             className="flex cursor-pointer items-center justify-between gap-2 rounded-lg bg-muted/30 px-2 py-1.5 text-xs"
                           >
-                            <span className="min-w-0 truncate text-muted-foreground">{it.memo ?? "메모 없음"}</span>
+                            <span className="min-w-0 truncate text-muted-foreground">{it.memo ? mask("merchant", it.memo) : "메모 없음"}</span>
                             <span className="shrink-0 tabular-nums text-muted-foreground">{mask("amount", won(it.amount))}</span>
                           </div>
                         ))}

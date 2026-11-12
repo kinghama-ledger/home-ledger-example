@@ -1,7 +1,9 @@
 import { isDeepStrictEqual } from "node:util";
 
 const sms = await import("../src/lib/household/sms");
-const { parseSms, smsDedupKey, isNonTransactionalSms, skipDisposition, skipDedupKey, cashbackComboPayAmount, ignoreTraceGuessedType, isCardBillDoneNotice, isPointCashbackNotice, isTMembershipUsageNotice } = sms;
+const { parseSms, smsDedupKey, isNonTransactionalSms, skipDisposition, skipDedupKey, notificationDedupKey, cashbackComboPayAmount, ignoreTraceGuessedType, isCardBillDoneNotice, isPointCashbackNotice, isTMembershipUsageNotice, isPaymentOtpNotice, isRevolvingCarryNotice } = sms;
+// 설계 207 예시 문구(가상): 발신번호를 감싼 방향 제어문자(U+2068/U+2069)까지 실제 수신 꼴을 흉내낸다.
+const paymentOtpSampleText = "⁨1500-0000⁩인증번호[135790] 결제창에 입력 시 48,200원 정상결제 됩니다[네이버페이]";
 
 let pass = 0;
 let fail = 0;
@@ -22,6 +24,32 @@ function ok(condition: boolean, message: string) {
 }
 
 const cases = [
+  // 설계 213: 디지털온누리 결제 문자 두 꼴(값은 가상).
+  {
+    name: "디지털온누리 결제되었어요 꼴",
+    text: "결제되었어요 김하늘님, 주식회사 한빛마트에서 6,400원이 결제되었어요.",
+    expected: { kind: "approve", amount: 6400, merchant: "주식회사 한빛마트", date: null, time: null, balance: null, cardLast4: null, institution: "디지털온누리" },
+  },
+  {
+    name: "디지털온누리 승인 꼴",
+    text: "결제 온누리(2*4*)김*늘님 09/05 18:02/일시불/승인/6,400원/(주)한빛마트",
+    expected: { kind: "approve", amount: 6400, merchant: "(주)한빛마트", date: "2026-09-05", time: "18:02", balance: null, cardLast4: null, institution: "디지털온누리" },
+  },
+  {
+    name: "디지털온누리 취소 꼴",
+    text: "결제 온누리(2*4*)김*늘님 09/05 18:03/일시불/취소/6,400원/(주)한빛마트",
+    expected: { kind: "cancel", amount: 6400, merchant: "[취소] (주)한빛마트", date: "2026-09-05", time: "18:03", balance: null, cardLast4: null, institution: "디지털온누리" },
+  },
+  {
+    name: "디지털온누리 할부 승인 꼴",
+    text: "결제 온누리(2*4*)김*늘님 09/05 18:04/할부3개월/승인/30,000원/(주)한빛마트",
+    expected: { kind: "approve", amount: 30000, merchant: "(주)한빛마트", date: "2026-09-05", time: "18:04", balance: null, cardLast4: null, institution: "디지털온누리", installmentMonths: 3 },
+  },
+  {
+    name: "이름에 '온누리'가 든 가게의 카드 승인은 디지털온누리 기관이 아님",
+    text: "국민카드 승인 12,000원 09/05 18:05 한빛온누리약국",
+    expected: { kind: "approve", amount: 12000, merchant: "한빛온누리약국", date: "2026-09-05", time: "18:05", balance: null, cardLast4: null, institution: "국민카드" },
+  },
   {
     // 설계 193: KB스타뱅킹 알림푸시는 은행명 없이 KB 전용 6-2-6 마스크만 보낸다.
     name: "KB스타뱅킹 새 계좌 마스크 입금",
@@ -334,12 +362,14 @@ for (const c of cases) {
   ok(parsed.amount === c.expected.amount, `${c.name}: amount=${parsed.amount}`);
   ok(parsed.merchant === c.expected.merchant, `${c.name}: merchant=${parsed.merchant}`);
   ok(parsed.occurredAt === c.expected.date, `${c.name}: date=${parsed.occurredAt}`);
+  if ("time" in c.expected) ok(parsed.occurredTime === c.expected.time, `${c.name}: time=${parsed.occurredTime}`);
   ok(parsed.balance === c.expected.balance, `${c.name}: balance=${parsed.balance}`);
   ok(parsed.cardLast4 === c.expected.cardLast4, `${c.name}: cardLast4=${parsed.cardLast4}`);
   if ("accountTail" in c.expected) ok(parsed.accountTail === c.expected.accountTail, `${c.name}: accountTail=${parsed.accountTail}`);
   if ("accountPrefix" in c.expected) ok(parsed.accountPrefix === c.expected.accountPrefix, `${c.name}: accountPrefix=${parsed.accountPrefix}`);
   if ("accountSuffix" in c.expected) ok(parsed.accountSuffix === c.expected.accountSuffix, `${c.name}: accountSuffix=${parsed.accountSuffix}`);
   ok(parsed.institution === c.expected.institution, `${c.name}: institution=${parsed.institution}`);
+  if ("installmentMonths" in c.expected) ok(parsed.installmentMonths === c.expected.installmentMonths, `${c.name}: installmentMonths=${parsed.installmentMonths}`);
   if ("loanTerms" in c.expected) {
     ok(isDeepStrictEqual(parsed.loanTerms, c.expected.loanTerms), `${c.name}: loanTerms=${JSON.stringify(parsed.loanTerms)}`);
   }
@@ -855,7 +885,7 @@ for (const n of noiseCases) {
 }
 
 // 스킵 처리 방식 skipDisposition — 명백한 광고=흔적없이 버림 / 미인식=휴지통 흔적 / 정상=적재. (설계 docs/household/56)
-const dispCases: { name: string; text: string; disp: "keep" | "ignore-noise" | "trace-unknown" | "ignore-trace"; cardBillDone?: boolean; pointCashback?: boolean; tMembership?: boolean; sender?: string }[] = [
+const dispCases: { name: string; text: string; disp: "keep" | "ignore-noise" | "trace-unknown" | "ignore-trace"; cardBillDone?: boolean; pointCashback?: boolean; tMembership?: boolean; paymentOtp?: boolean; revolving?: boolean; sender?: string }[] = [
   // 명백한 광고/정보성 → ignore-noise (흔적없이 버림)
   { name: "(광고) → ignore-noise", text: "[Web발신]\n(광고) 하나은행\n시원한 커피가 공짜", disp: "ignore-noise" },
   { name: "쿠팡 혜택안내 → ignore-noise", text: "3,076원 할인! 받은 혜택을 확인해 보세요. ■ 혜택내용 - 결제", disp: "ignore-noise" },
@@ -1466,6 +1496,217 @@ const dispCases: { name: string; text: string; disp: "keep" | "ignore-noise" | "
     disp: "ignore-trace",
     tMembership: true,
   },
+  // 설계 207 — 결제창에 넣는 인증번호는 결제 완료가 아니므로 pending 대신 휴지통 흔적으로 보존한다.
+  {
+    name: "결제 인증번호 안내(방향 제어문자 포함) → ignore-trace (설계 207)",
+    text: paymentOtpSampleText,
+    disp: "ignore-trace",
+    paymentOtp: true,
+  },
+  {
+    name: "결제 인증번호 안내(발신번호 없음) → ignore-trace (설계 207)",
+    text: "인증번호[135790] 결제창에 입력 시 48,200원 정상결제 됩니다[네이버페이]",
+    disp: "ignore-trace",
+    paymentOtp: true,
+  },
+  {
+    name: "결제 인증번호 안내([Web발신] 접두) → ignore-trace (설계 207)",
+    text: "[Web발신] 인증번호[135790] 결제창에 입력 시 48,200원 정상결제 됩니다[네이버페이]",
+    disp: "ignore-trace",
+    paymentOtp: true,
+  },
+  {
+    // `승인번호`는 완료 거래신호가 아니다. 독립된 `승인`만 가드한다.
+    name: "결제 인증번호 안내에 승인번호 표기 → ignore-trace (설계 207 승인번호 제외)",
+    text: "[Web발신] 인증번호 [246810] 입력하면 19,300원 결제됩니다. 승인번호는 결제 후 안내됩니다.",
+    disp: "ignore-trace",
+    paymentOtp: true,
+  },
+  {
+    name: "카드 승인 꼴 → keep (설계 207 종전 판정)",
+    text: "KB국민카드9012승인 김*늘님 19,300원 일시불 03/14 18:54 (주)한빛마트 누적512,300원",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  {
+    name: "은행 출금 꼴 → keep (설계 207 종전 판정)",
+    text: "[Web발신] 우리 03/14 21:47 *000000 출금 3,800원 씨유(CU)한빛푸 잔액 87,650원",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  {
+    // 은행·카드 거래신호 가드를 지우면 ignore-trace 로 뒤집힌다.
+    name: "인증번호가 덧붙은 완료 승인 → keep (설계 207 거래신호 가드)",
+    text: "[Web발신] 인증번호 [246810] 입력 시 19,300원 승인되었습니다.",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  {
+    name: "인증번호 안내가 덧붙은 은행 출금 → keep (설계 207 출금 가드)",
+    text: "[Web발신] 인증번호 [246810] 입력 시 3,800원 결제됩니다. 우리은행 출금",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  {
+    name: "인증번호 안내가 덧붙은 은행 입금 → keep (설계 207 입금 가드)",
+    text: "[Web발신] 인증번호 [246810] 입력하면 3,800원 결제됩니다. 우리은행 입금",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  {
+    // 완료형 가드를 지우면 ignore-trace 로 뒤집힌다.
+    name: "인증번호가 덧붙은 결제 완료 → keep (설계 207 완료형 가드)",
+    text: "[Web발신] 인증번호 [246810] 입력하시면 19,300원 결제가 완료되었습니다.",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  {
+    // 실패어 가드: 이 규칙이 실패 안내 규칙보다 앞이라 없으면 금액 실은 휴지통 행이 된다.
+    name: "인증번호 입력 뒤 결제 실패 → ignore-noise (설계 207 실패어 가드)",
+    text: "[Web발신] 인증번호 [246810] 입력 시 21,000원 결제 실패",
+    disp: "ignore-noise",
+    paymentOtp: false,
+  },
+  {
+    name: "인증번호 잘못 입력 시 결제 거절 안내 → ignore-noise (설계 207 실패어 가드)",
+    text: "[네이버페이] 인증번호를 잘못 입력하시면 48,200원 결제가 거절됩니다",
+    disp: "ignore-noise",
+    paymentOtp: false,
+  },
+  {
+    // 문장 경계: 문장을 넘어 읽으면 뒤 문장의 실결제가 휴지통으로 간다.
+    name: "로그인 인증 안내 뒤에 붙은 실결제 → keep (설계 207 문장 경계)",
+    text: "[Web발신] 인증번호를 입력하면 로그인됩니다. [카카오페이] 해오름커피 21,000원 결제",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  {
+    // `입력 시(?![간각작도])`: 지우면 `입력시간` 이 조건부 `입력 시` 로 읽힌다.
+    name: "입력시간 표기가 든 승인성 문자 → keep (설계 207 입력시간 배제)",
+    text: "[신한카드] 본인인증번호 [246810] 입력시간 03/14 12:00 이용금액 19,300원 결제",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  ...[
+    ["결제됐어요", "됐"],
+    ["결제했어요", "했"],
+    ["결제 성공", "성공"],
+    ["결제가 정상 처리되었습니다", "처리"],
+    ["결제되었어요", "되었"],
+    ["결제취소", "취소"],
+  ].map(([tail, branch]) => ({
+    name: `인증번호 꼴 + 완료형 '${tail}' → keep (설계 207 완료형 갈래 ${branch})`,
+    text: `인증번호[246810] 입력 시 19,300원 ${tail}`,
+    disp: "keep" as const,
+    paymentOtp: false,
+  })),
+  // 실패어·완료형은 인증번호 조건 문장 조각에만 건다. 전체에 걸면 아래 꼬리말만으로 pending 으로 샌다.
+  ...[
+    [" 유효시간 3분 초과 시 재요청", "초과 꼬리말"],
+    ["\n5회 입력 오류 시 결제가 제한됩니다", "오류 꼬리말"],
+    ["\n타인에게 알려주지 마세요. 재사용 불가", "불가 꼬리말"],
+    ["\n요청하지 않은 결제라면 거절 후 고객센터로", "거절 꼬리말"],
+    ["\n결제 취소는 네이버페이 앱에서 가능합니다", "결제 취소 꼬리말"],
+  ].map(([tail, label]) => ({
+    name: `결제 인증번호 + ${label} → ignore-trace (설계 207 조각 한정)`,
+    text: paymentOtpSampleText + tail,
+    disp: "ignore-trace" as const,
+    paymentOtp: true,
+  })),
+  {
+    // `처리` 는 완료(되었·됐·완료)와 붙을 때만 완료형이다 — `처리됩니다` 는 조건부 문투.
+    name: "결제 인증번호 '결제가 정상 처리됩니다' → ignore-trace (설계 207 처리 조건부)",
+    text: "인증번호[135790] 결제창에 입력 시 48,200원 결제가 정상 처리됩니다",
+    disp: "ignore-trace",
+    paymentOtp: true,
+  },
+  {
+    // 줄바꿈 경계: 공백 정규화로 \n 을 지우면 다음 줄의 실결제가 휴지통으로 간다.
+    name: "마침표 없이 줄바꿈으로 이어진 로그인 안내 + 실결제 → keep (설계 207 줄바꿈 경계)",
+    text: "[Web발신]\n인증번호를 입력하면 로그인됩니다\n[카카오페이] 해오름커피 21,000원 결제",
+    disp: "keep",
+    paymentOtp: false,
+  },
+  {
+    // '다·요' 로 끝나지 않은 줄바꿈은 한 문장이 꺾인 것 — 이어 읽는다.
+    name: "결제 인증번호가 '입력 시' 뒤에서 줄바꿈 → ignore-trace (설계 207 문장 꺾임)",
+    text: "인증번호[135790] 결제창에 입력 시\n48,200원 정상결제 됩니다",
+    disp: "ignore-trace",
+    paymentOtp: true,
+  },
+  {
+    // 뒤에 공백 없는 마침표는 문장 끝이 아니다.
+    name: "결제 인증번호에 마침표 든 상호(example.com) → ignore-trace (설계 207 마침표)",
+    text: "[한빛몰] 인증번호[135790] 결제창에 입력 시 example.com/bill 9,900원 결제됩니다",
+    disp: "ignore-trace",
+    paymentOtp: true,
+  },
+  {
+    // 조각 꼬리는 결제사 대괄호에서 멈춘다 — 멈추지 않으면 붙어 온 '취소불가' 안내가 완료형·실패어로 읽힌다.
+    name: "결제 인증번호 뒤 대괄호에 붙은 '취소불가' 안내 → ignore-trace (설계 207 꼬리 대괄호 멈춤)",
+    text: "인증번호[135790] 입력 시 9,900원 결제됩니다[토스]취소불가",
+    disp: "ignore-trace",
+    paymentOtp: true,
+  },
+  {
+    name: "금액 없는 일반 인증번호 → trace-unknown (설계 207 종전 판정)",
+    text: "[Web발신] 인증번호 [246810]를 입력해주세요",
+    disp: "trace-unknown",
+    paymentOtp: false,
+  },
+  // 설계 217 — 리볼빙 '다음달 결제일로 이월' 안내는 실출금이 아니다 → 휴지통 흔적.
+  {
+    name: "리볼빙 이월 안내 → ignore-trace (설계 217)",
+    text: "일부결제금액이월약정(리볼빙) 김*늘님 일부결제금액이월약정(리볼빙) 이용금액 중 18,400원이 다음달 결제일로 이월되었습니다.",
+    disp: "ignore-trace",
+    revolving: true,
+  },
+  {
+    name: "리볼빙 이월 안내([Web발신] 접두) → ignore-trace (설계 217)",
+    text: "[Web발신] 일부결제금액이월약정(리볼빙) 김*늘님 일부결제금액이월약정(리볼빙) 이용금액 중 18,400원이 다음달 결제일로 이월되었습니다.",
+    disp: "ignore-trace",
+    revolving: true,
+  },
+  {
+    // 거래신호 가드의 `승인` 갈래를 지우면 ignore-trace 로 뒤집힌다.
+    name: "리볼빙 문구가 붙은 카드 승인 → keep (설계 217 승인 가드)",
+    text: "[Web발신] 하나카드 승인 김*늘 9,500원 일시불 03/14 10:00 해오름커피 리볼빙 18,400원 이월되었습니다",
+    disp: "keep",
+    revolving: false,
+  },
+  {
+    // 거래신호 가드의 `출금` 갈래를 지우면 ignore-trace 로 뒤집힌다.
+    name: "리볼빙 결제 은행 출금 → keep (설계 217 출금 가드)",
+    text: "[Web발신] 우리 03/14 10:00 *000000 출금 18,400원 리볼빙 이월되었던 금액 잔액 87,650원",
+    disp: "keep",
+    revolving: false,
+  },
+  {
+    name: "리볼빙 이월 안내('이월됐습니다' 꼴) → ignore-trace (설계 217)",
+    text: "[Web발신] 리볼빙 이용금액 중 18,400원이 다음달 결제일로 이월됐습니다.",
+    disp: "ignore-trace",
+    revolving: true,
+  },
+  {
+    // `(?!던)` 을 지우면 이 청구 안내가 휴지통으로 간다.
+    name: "'이월되었던 금액 포함' 청구 안내 → 비발동 (설계 217 관형형 경계, 종전 ignore-noise)",
+    text: "[Web발신] 결제예정금액 280,000원(리볼빙 이월되었던 금액 포함) 결제일 3/25",
+    disp: "ignore-noise",
+    revolving: false,
+  },
+  {
+    // 넓은 거래신호(`승인번호` 포함)를 좁히면 이 문자가 휴지통으로 간다.
+    name: "리볼빙 이월 문구 + 승인번호 → 비발동 (설계 217 넓은 거래신호)",
+    text: "[Web발신] 리볼빙 18,400원이 다음달 결제일로 이월되었습니다. 승인번호 4321",
+    disp: "keep",
+    revolving: false,
+  },
+  {
+    name: "리볼빙 신청 완료 안내(금액 없음) → ignore-noise (설계 217 비발동, 종전 판정)",
+    text: "[Web발신] 일부결제금액이월약정(리볼빙) 신청이 완료되었습니다. 약정결제비율 10%",
+    disp: "ignore-noise",
+    revolving: false,
+  },
 ];
 // 재검증 M3: 'YYYY년 M월 D일' 은 연도를 믿는다 — 오늘보다 미래여도 작년으로 밀지 않는다(취소 영수증 2026년 9월 2일 → 2025-09-02 로 앉던 것).
 {
@@ -1479,9 +1720,11 @@ for (const c of dispCases) {
   const cardBillDoneMatches = c.cardBillDone === undefined || isCardBillDoneNotice(c.text) === c.cardBillDone;
   const pointCashbackMatches = c.pointCashback === undefined || isPointCashbackNotice(c.text) === c.pointCashback;
   const tMembershipMatches = c.tMembership === undefined || isTMembershipUsageNotice(c.text) === c.tMembership;
+  const paymentOtpMatches = c.paymentOtp === undefined || isPaymentOtpNotice(c.text) === c.paymentOtp;
+  const revolvingMatches = c.revolving === undefined || isRevolvingCarryNotice(c.text) === c.revolving;
   ok(
-    got === c.disp && cardBillDoneMatches && pointCashbackMatches && tMembershipMatches,
-    `disp[${c.name}]: ${got}, cardBillDone=${isCardBillDoneNotice(c.text)}, pointCashback=${isPointCashbackNotice(c.text)}, tMembership=${isTMembershipUsageNotice(c.text)}`
+    got === c.disp && cardBillDoneMatches && pointCashbackMatches && tMembershipMatches && paymentOtpMatches && revolvingMatches,
+    `disp[${c.name}]: ${got}, cardBillDone=${isCardBillDoneNotice(c.text)}, pointCashback=${isPointCashbackNotice(c.text)}, tMembership=${isTMembershipUsageNotice(c.text)}, paymentOtp=${isPaymentOtpNotice(c.text)}, revolving=${isRevolvingCarryNotice(c.text)}`
   );
 }
 // 설계 221: 포인트 캐시백 적립의 휴지통 행은 수입으로 싣는다(지출로 보이면 휴지통에서 오해한다).
@@ -1490,13 +1733,29 @@ ok(ignoreTraceGuessedType("350원 입금 해봄증권 수수료 캐시백") === 
 // 설계 205-B: ignore-trace 중 카드대금 사후 안내만 payment, 기존 196 휴대폰 소액결제는 expense 유지.
 ok(ignoreTraceGuessedType(cardBillDoneSampleText) === "payment", "ignoreTraceGuessedType[카드대금 출금완료=payment]");
 ok(ignoreTraceGuessedType(mobilePaymentReceipt196) === "expense", "ignoreTraceGuessedType[설계 196 휴대폰 소액결제=expense]");
+ok(ignoreTraceGuessedType(paymentOtpSampleText) === "expense", "ignoreTraceGuessedType[설계 207 결제 인증번호=expense]");
 
-// skipDedupKey — 같은 원문+날짜는 같은 키(반복 억제), 날짜 다르면 다른 키.
+// skipDedupKey — 접두·날짜 계약은 유지하되 원문 앞머리는 sha256 으로만 남긴다.
 {
   const t = "택배가 방금 도착했습니다. 문 앞을 확인하세요.";
-  ok(skipDedupKey(t, "2026-07-03") === skipDedupKey(t, "2026-07-03"), "skipDedup[동일 원문·날짜=같은 키]");
-  ok(skipDedupKey(t, "2026-07-03") !== skipDedupKey(t, "2026-07-04"), "skipDedup[날짜 다르면 다른 키]");
-  ok(skipDedupKey(t, "2026-07-03").startsWith("skip|"), "skipDedup[skip| 접두]");
+  const key = skipDedupKey(t, "2026-07-03");
+  ok(key === skipDedupKey(t, "2026-07-03"), "skipDedup[동일 입력=같은 키]");
+  ok(key !== skipDedupKey(t, "2026-07-04"), "skipDedup[날짜 다르면 다른 키]");
+  ok(/^skip\|[0-9a-f]{64}\|2026-07-03$/.test(key), "skipDedup[skip| + 64자 hex + 날짜]");
+  ok(!key.includes(t.slice(0, 10)), "skipDedup[원문 앞머리 미포함]");
+  ok(skipDedupKey("synthetic skip head", "2026-09-28") === "skip|c770c51a060dcf5da1b246c82597486772b7c4fa2443aef2422b81a5bc0a31f1|2026-09-28", "skipDedup[SQL 교차검증 벡터]");
+}
+
+// 알림 dedup — title|text|분시각의 결합 문자열은 sha256 으로만 남긴다.
+{
+  const title = "합성 알림";
+  const body = "본문_100%";
+  const minute = "2026-09-28 09:30";
+  const key = notificationDedupKey(title, body, minute);
+  ok(key === notificationDedupKey(title, body, minute), "notificationDedup[동일 입력=같은 키]");
+  ok(/^noti\|[0-9a-f]{64}$/.test(key), "notificationDedup[noti| + 64자 hex]");
+  ok(!key.includes(title) && !key.includes(body), "notificationDedup[제목·본문 평문 미포함]");
+  ok(key === "noti|28e9a310e1e9990f5acf7e0ba23fc9e438eee1ec3f30bd13ede4ce1c6c360b08", "notificationDedup[한글 SQL 교차검증 벡터]");
 }
 
 // 계좌 끝자리 추출 회귀 (설계 docs/household/25)

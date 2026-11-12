@@ -228,5 +228,87 @@ console.log("\n[10] 설계 226 — 해지 지갑은 후보에서 빠진다(해�
   eq("입금계좌 = 활성 토스페이(김하늘)", fields.guessed_to_account_id, ACC_TOSSPAY_KHN);
 }
 
+// ── 설계 208: 카카오페이 충전 알림은 이체 ───────────────────────────────────
+// 값은 전부 가상이다. 카카오페이 지갑은 김하늘 것 하나뿐인 상태.
+const ACC_KAKAOPAY_KHN = "acc-kakaopay-khn"; // 카카오페이(김하늘) 계좌번호 없음
+const kakaoPayTables = (): Record<string, Row[]> => ({
+  ...tables(),
+  hh_account: [
+    ...ACCOUNTS,
+    { owner_auth_uid: OWNER, id: ACC_TOSS_KHN, name: "토스뱅크(김하늘)", account_no: null, person_id: P_KHN, is_active: true },
+    { owner_auth_uid: OWNER, id: ACC_KAKAOPAY_KHN, name: "카카오페이(김하늘)", account_no: null, person_id: P_KHN, is_active: true },
+  ],
+});
+
+console.log("\n[11] 설계 208 — 토스뱅크→카카오페이 충전 알림은 이체");
+{
+  const { fields } = await enrichParsed(stub(kakaoPayTables()), OWNER, "30,000원 출금 내 토스뱅크 통장 → 카카오페이", null);
+  eq("유형 = 이체", fields.guessed_type, "transfer");
+  eq("출금계좌 = 토스뱅크(김하늘) (규칙 폴백)", fields.guessed_from_account_id, ACC_TOSS_KHN);
+  eq("입금계좌 = 카카오페이(김하늘)", fields.guessed_to_account_id, ACC_KAKAOPAY_KHN);
+  eq("이체라 단일계좌는 비운다", fields.guessed_account_id, null);
+}
+
+console.log("\n[12] 설계 208 — 상대처에 '카카오페이'가 든 카드 결제 알림은 이체로 바꾸지 않는다");
+{
+  const { parsed, fields } = await enrichParsed(stub(kakaoPayTables()), OWNER, "12원 캐시백 🎉 4,200원 결제 한빛주차_카카오페이 잔액 1,234,560원(토스뱅크 체크카드)", null);
+  ne("문자 종류는 출금이 아니다(전제)", parsed.kind, "withdraw");
+  ne("★유형 ≠ 이체", fields.guessed_type, "transfer");
+  eq("입금계좌를 채우지 않는다", fields.guessed_to_account_id, null);
+}
+
+console.log("\n[13] 설계 208 — 규칙 판정: 출금만 · 완전일치만");
+{
+  const { matchTransferRule } = await import("../src/lib/household/defaults");
+  eq("카카오페이 + kind 없음 → null", matchTransferRule("카카오페이"), null);
+  eq("카카오페이 + approve → null", matchTransferRule("카카오페이", "approve"), null);
+  eq("카카오페이 + withdraw → 카카오페이", matchTransferRule("카카오페이", "withdraw")?.to, "카카오페이");
+  // 종류 판정이 '이체|송금'을 입금보다 먼저 봐서 카카오페이→은행 입금이 transfer 로 올 수 있다(방향 뒤집힘).
+  eq("카카오페이 + transfer → null", matchTransferRule("카카오페이", "transfer"), null);
+  eq("카카오페이 + deposit → null", matchTransferRule("카카오페이", "deposit"), null);
+  // 완전일치 — 이름이 이어지는 다른 회사
+  eq("카카오페이증권 + withdraw → null", matchTransferRule("카카오페이증권", "withdraw"), null);
+  eq("카카오페이손해보험 + withdraw → null", matchTransferRule("카카오페이손해보험", "withdraw"), null);
+  eq("지역화폐 규칙은 부분일치 그대로", matchTransferRule("지역화폐 오픈뱅킹", "withdraw")?.to, "한빛페이");
+  eq("지역화폐 규칙은 종류 무관 그대로", matchTransferRule("지역화폐", "approve")?.to, "한빛페이");
+}
+
+console.log("\n[14] ★설계 208 — 출금계좌 주인의 지갑이 없으면 남의 지갑을 채우지 않는다");
+{
+  // 국민은행(이바다)에서 카카오페이로 출금. 카카오페이 지갑은 김하늘 것 하나뿐이다.
+  const sms = "출금 30,000원이*다님 03/14 15:21 110-11-0***-111 카카오페이 출금 30,000 잔액2,345,670";
+  const { parsed, fields } = await enrichParsed(stub(kakaoPayTables()), OWNER, sms, null);
+  eq("상대처 = 카카오페이(전제)", parsed.merchant, "카카오페이");
+  eq("유형 = 이체", fields.guessed_type, "transfer");
+  eq("출금계좌 = 국민은행(이바다) (문자가 지목)", fields.guessed_from_account_id, ACC_KB_LBD);
+  eq("★입금계좌 = 빈칸 (카카오페이(김하늘)로 채우지 않는다)", fields.guessed_to_account_id, null);
+}
+
+console.log("\n[15] 설계 208 — 토스 알림 '→ 카카오페이증권' 은 이체가 아니다");
+{
+  const { parsed, fields } = await enrichParsed(stub(kakaoPayTables()), OWNER, "30,000원 출금 내 토스뱅크 통장 → 카카오페이증권", null);
+  eq("상대처 = 카카오페이증권(전제)", parsed.merchant, "카카오페이증권");
+  ne("★유형 ≠ 이체", fields.guessed_type, "transfer");
+  eq("입금계좌를 채우지 않는다", fields.guessed_to_account_id, null);
+}
+
+console.log("\n[16] 설계 208 — 은행 출금 적요 '카카오페이손해보험' 이 기관 '카카오페이'로 잘려 충전 이체가 되지 않는다");
+{
+  // 은행 출금 형식은 적요에서 기관명을 뽑아 상대처로 쓴다 — 뒤에 글자가 붙은 다른 회사는 기관으로 자르지 않는다.
+  for (const desc of ["카카오페이손해보험", "카카오페이손보"]) {
+    const sms = `출금 15,000원이*다님 03/14 15:21 110-11-0***-111 ${desc} 출금 15,000 잔액2,345,670`;
+    const { parsed, fields } = await enrichParsed(stub(kakaoPayTables()), OWNER, sms, null);
+    eq(`${desc}: 상대처 그대로`, parsed.merchant, desc);
+    ne(`${desc}: ★유형 ≠ 이체`, fields.guessed_type, "transfer");
+    eq(`${desc}: 입금계좌를 채우지 않는다`, fields.guessed_to_account_id, null);
+  }
+  // 회귀: 진짜 충전(적요 '카카오페이' 단독·'카카오페이충전')과 서비스 표기(머니·결제)는 그대로 기관 카카오페이다.
+  for (const desc of ["카카오페이", "카카오페이충전", "카카오페이머니", "카카오페이결제"]) {
+    const sms = `출금 30,000원이*다님 03/14 15:21 110-11-0***-111 ${desc} 출금 30,000 잔액2,345,670`;
+    const { parsed } = await enrichParsed(stub(kakaoPayTables()), OWNER, sms, null);
+    eq(`${desc}: 상대처 = 카카오페이(회귀)`, parsed.merchant, "카카오페이");
+  }
+}
+
 console.log(fail === 0 ? "\n전부 통과 ✅" : `\n실패 ${fail}건 ❌`);
 process.exit(fail === 0 ? 0 : 1);

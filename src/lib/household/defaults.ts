@@ -213,10 +213,18 @@ export const DEFAULT_MERCHANT_MAP: { key: string; category: string }[] = [
 //     (한빛페이(김하늘)/한빛페이(이바다)) 이름 하나로는 못 고르고, from 계좌의 주인으로 좁힌다.
 //   해석은 전부 sms-ingest.enrichParsed 가 한다.
 //   - `kinds` 를 적으면 그 종류의 문자에서만 발동한다(예: 출금 문자만). 안 적으면 종류를 가리지 않는다.
-export const DEFAULT_TRANSFER_RULES: { keys: string[]; from: string; to: string; kinds?: SmsKind[] }[] = [
+//   - `exact` 면 상대처가 key 와 **완전히 같을 때만** 발동한다(부분일치는 `카카오페이증권` 같은 다른 회사까지 먹는다). (설계 208)
+export const DEFAULT_TRANSFER_RULES: { keys: string[]; from: string; to: string; kinds?: SmsKind[]; exact?: boolean }[] = [
   // 지역화폐(예시 지갑 이름: 한빛페이) 충전. 상대처 예: 지역화폐 운영사 이름(토스 알림) /
   // "지역화폐 오픈뱅킹"(은행 출금 SMS). 후자는 문자에 출금계좌가 있으므로 아래 from 은 안 쓰인다.
   { keys: ["지역화폐", "코나아이"], from: "카카오뱅크(김하늘)", to: "한빛페이" },
+  // 카카오페이 충전 — "30,000원 출금 내 토스뱅크 통장 → 카카오페이"(토스 알림). (설계 208)
+  // ★출금 문자로만 좁힌다 — 카드 승인 상대처에도 '카카오페이'가 들어간다(`가게이름_카카오페이` 꼴의 결제).
+  //   그건 결제라 이체로 바꾸면 지출이 사라진다. `transfer` 도 넣지 않는다 — 문자 종류 판정이 '이체|송금'을
+  //   입금보다 먼저 봐서, 카카오페이→은행 입금이 transfer 로 오면 방향이 뒤집힌 이체가 채워진다.
+  // ★완전일치 — `카카오페이증권`·`카카오페이손해보험` 출금은 충전이 아니다.
+  // from 은 이름 조각이다 — `토스뱅크` 가 든 계좌가 하나일 때만 기본값으로 쓰인다(문자가 계좌를 지목하면 그쪽이 이긴다).
+  { keys: ["카카오페이"], from: "토스뱅크", to: "카카오페이", kinds: ["withdraw"], exact: true },
   // 토스페이 충전 — "100,000원 출금 내 토스뱅크 통장 → (주)비바리퍼블리카(토스페이충전)"(토스 알림). (설계 226)
   //   규칙이 없으면 지출로 추정되고, `토스페이` 가 든 학습 키가 있으면 그 분류까지 붙는다.
   // ★키는 `토스페이충전` — `토스페이` 로 넓히면 `(주)비바리퍼블리카(토스페이)` 꼴의 결제·구독료 출금까지 이체가 된다.
@@ -264,7 +272,7 @@ export function matchTransferRule(
   if (!c) return null;
   for (const rule of DEFAULT_TRANSFER_RULES) {
     if (rule.kinds && !(kind && rule.kinds.includes(kind))) continue;
-    if (rule.keys.some((k) => c.includes(k))) return { from: rule.from, to: rule.to };
+    if (rule.keys.some((k) => (rule.exact ? c === k : c.includes(k)))) return { from: rule.from, to: rule.to };
   }
   return null;
 }

@@ -65,7 +65,7 @@ export interface CashflowItem {
   amount: number;
   source: "scheduled" | "loan" | "installment";
   sourceId: string; // 원본 레코드 id (scheduled/loan/installment)
-  day: number | null; // 납부일(1~28). 없으면 null
+  day: number | null; // 납부일(1~31, 31=말일 — 그 달 말일로 맞춰진다). 없으면 null
   direction: "out" | "in";
 }
 
@@ -86,7 +86,7 @@ function lastDayOf(ym: string): number {
   const [y, m] = ym.split("-").map(Number);
   return new Date(y, m, 0).getDate();
 }
-function clampDayToMonth(day: number | null | undefined, ym: string): number | null {
+export function clampDayToMonth(day: number | null | undefined, ym: string): number | null {
   if (day == null) return null;
   return Math.min(day, lastDayOf(ym));
 }
@@ -172,6 +172,60 @@ export function monthlyCashflow(
   return { items, totalOut, totalIn };
 }
 
+/** 설계 219 — 직전 실제액으로 예정을 바꾸는 폭(월상환 대비). 매칭 허용폭(LOAN_ID_MATCH_RATE)보다 좁아야 한다:
+ *  바뀐 예정과 이번 달 실제가 둘 다 월상환 근처에서 흔들려도 서로 허용폭 안에 남게. */
+export const LOAN_ACTUAL_SWAP_RATE = 0.03;
+/** 설계 219 — loan_id 짝(0패스)의 금액 허용폭. 하한 1,000원은 근사-정밀과 같다. */
+export const LOAN_ID_MATCH_RATE = 0.05;
+
+// 대출 예정금액을 직전 실제 상환액으로 바꾼 사본. (설계 219)
+//
+// 변동금리 대출은 월납이 매달 몇십~몇천 원 흔들린다. 대출 원장의 월상환을 매번 손으로 고치게 하지 않고,
+// 화면 계산에서만 실제액을 쓴다.
+// 기준 달 = refYm 이하에서 이 대출에 연결된(loan_id) 상환이 있는 가장 최근 달. 범위는 호출부가 넘긴 풀이 정한다 —
+//   현금흐름·홈 모두 최근 3개월(당월−2 ~)만 넘겨야 두 화면이 같다(설계 79).
+// 아래면 원값 그대로:
+//   ① 상환이 끝났거나(status) 월상환이 없거나 0 — 이런 대출은 종전대로 항목을 안 만든다.
+//   ② **정기지출과 겹친 대출** — 풀 안의 연결 상환 중 하나라도 활성 정기지출이 자기 것으로 주장하면(정확금액이거나
+//      상호+근사 ±30%, 매칭의 claimedByNonLoan 과 같은 자) 바꾸지 않는다. 같은 대출을 대출 원장과 정기지출 양쪽에
+//      등록해 두면, 정기지출 금액과 같은 상환이 기준이 되는 순간 대출 예정이 정기지출과 같은 금액이 되고 남은 달치를
+//      정확금액으로 가져가 예측에 두 번 든다. 금액 차이에 기대면 언젠가 뚫리므로 구조로 막는다.
+//   ③ 그 달 상환이 2건 이상 — 어느 것이 이 대출 몫인지 모른다.
+//   ④ 실제액이 월상환의 ±3% 밖 — 일부상환·중도상환 같은 일회성 금액이 다음 달 예정을 오염시키면, 다음 달 정상
+//      상환이 예정과 어긋나 '출금 없음'이 된다.
+//   3% 를 넘는 영구 변화(금리 재산정 등)는 대출 원장의 월상환을 고쳐야 한다.
+export function effectiveLoanPayments(
+  loans: HhLoan[],
+  outflows: ActualOutflow[],
+  refYm: string,
+  scheduled: HhScheduledPayment[],
+): HhLoan[] {
+  const claimants = scheduled
+    .filter((sp) => sp.is_active && sp.direction === "out" && (sp.amount ?? 0) > 0)
+    .map((sp) => ({ label: sp.title, amount: scheduledMonthlyAmount(sp) }));
+  const overlapped = new Set<string>();
+  const byLoan = new Map<string, { ym: string; amounts: number[] }>();
+  for (const t of outflows) {
+    if (!t.loan_id || !["payment", "expense", "transfer"].includes(t.type ?? "")) continue;
+    const ym = ymOf(t.txn_date);
+    // 기준 달 밖(미래)은 겹침 판정에도 넣지 않는다 — 조회 끝 날짜가 다른 화면끼리 결과가 갈리지 않게.
+    if (ym > refYm) continue;
+    if (claimants.some((c) => claimsOutflow(c, t))) overlapped.add(t.loan_id);
+    const cur = byLoan.get(t.loan_id);
+    if (!cur || ym > cur.ym) byLoan.set(t.loan_id, { ym, amounts: [t.amount] });
+    else if (ym === cur.ym) cur.amounts.push(t.amount);
+  }
+  return loans.map((loan) => {
+    const base = loan.monthly_payment;
+    if (loan.status !== "active" || !base || base <= 0 || overlapped.has(loan.id)) return loan;
+    const last = byLoan.get(loan.id);
+    if (!last || last.amounts.length !== 1) return loan;
+    const actual = last.amounts[0];
+    if (Math.abs(actual - base) > base * LOAN_ACTUAL_SWAP_RATE || actual === base) return loan;
+    return { ...loan, monthly_payment: actual };
+  });
+}
+
 // ───────────────────────── 예정 vs 실제 매칭 (설계 65) ─────────────────────────
 
 export interface ActualOutflow {
@@ -185,6 +239,8 @@ export interface ActualOutflow {
   payment_method_id?: string | null;
   /** 지출의 출금계좌 — payment 계좌 게이트(설계 166) 판정용. 없으면 판정하지 않는다. */
   account_id?: string | null;
+  /** 장부에서 연결된 대출 — 대출 항목의 0패스(설계 216) 판정용. 없으면 판정하지 않는다. */
+  loan_id?: string | null;
   /** 거래 카테고리 — 변동금액 항목(통신비) 매칭(설계 229) 판정용. 없으면 그 패스를 받지 못한다. */
   category_id?: string | null;
 }
@@ -242,6 +298,22 @@ function normLabel(s: string): string {
   return s.replace(/\s|㈜|\(주\)|주식회사/g, "").replace(/[()[\]\-_·]/g, "").toLowerCase().replace(/kb/g, "국민");
 }
 
+/** 출금 항목명과 거래 상호가 같은 곳인가 — matchOutflowActuals 의 상호일치(cpHit) 판정. 카드대금 부분 납부(설계 218)도 같은 자를 쓴다. */
+export function outflowCounterpartyHit(label: string, counterparty: string | null): boolean {
+  const nl = normLabel(label);
+  const cp = normLabel(counterparty ?? "");
+  return (
+    cp.length >= 2 &&
+    nl.length >= 2 &&
+    (nl.includes(cp.slice(0, Math.min(4, cp.length))) || cp.includes(nl.slice(0, Math.min(4, nl.length))))
+  );
+}
+
+// 대출 아닌 항목이 이 거래를 자기 것으로 주장하는가 — 정확금액이거나 상호+근사(±30%). (설계 216 claimedByNonLoan · 219)
+function claimsOutflow(o: { label: string; amount: number }, t: { amount: number; counterparty: string | null }): boolean {
+  return t.amount === o.amount || (outflowCounterpartyHit(o.label, t.counterparty) && Math.abs(t.amount - o.amount) <= Math.max(1000, o.amount * 0.3));
+}
+
 // 예상 출금항목을 실거래에 매칭. 한 거래는 한 항목에만 소비된다.
 //
 // ★2패스다(설계 131). 예전엔 항목 순서대로 한 번만 훑어서 **증거가 약한 항목이 먼저 가져갔다** —
@@ -271,6 +343,15 @@ function normLabel(s: string): string {
 // ★점수 체계(설계 188 개정): 40 = 정확금액+상호일치 · 36/33/30 = 정확금액을 계좌 일치도로 세분
 //   (payment 제외 — 아래 pass 안 주석) · 20 = 근사+상호일치 · 10 = payment 특례. 옛 4/3/2/1 의
 //   상대 순서는 그대로고, 정확금액 안에서만 '같은 계좌' 짝을 pass(36)로 먼저 확정한다.
+//   50 = 대출 항목 ↔ 장부에서 그 대출로 연결된(loan_id) 상환, 금액 max(1,000원, 5%) 안(설계 216·219) — 맨 앞 0패스. 날짜 가드는 받는다
+//   (아래 두 날짜 가드의 면제는 **40 만**이다). 15 = 변동금액 카테고리(설계 229). 패스는 50→40→36→20→15→10 여섯 번이다.
+//
+// ★**예정일이 아직 안 온 항목은 상호까지 맞는 짝(score 40)만 받는다**(설계 212) — 아직 나가지 않은 돈이
+//   '출금됨'으로 보이면 안 된다. `todayDay` 는 **당월 표시일 때만** 넘긴다(오늘 일자).
+//   금액만 같은 남의 거래(같은 금액의 주유·송금 등)가 예정일 며칠 전에 있으면 5일 가드 안쪽이라 붙어 버린다.
+//   미리 낸 돈이라도 상호가 안 맞으면 예정일부터 '출금됨'.
+//   ★동점(점수·금액차 같음)이면 **예정일에 가까운 거래**를 고른다 — 안 그러면 예정일이 지나는 순간
+//   며칠 앞선 남의 동일금액 거래가 배열 순서로 진짜 주인보다 먼저 붙는다.
 //
 // 반환: item.key → 매칭된 실거래.
 export function matchOutflowActuals(
@@ -281,13 +362,15 @@ export function matchOutflowActuals(
     day?: number | null;
     accountId?: string | null;
     accountBlind?: boolean;
+    /** 대출 항목일 때만 그 대출 id — 장부에서 이 대출로 연결된 상환을 먼저 받는다(설계 216). */
+    loanId?: string | null;
     /** 변동금액 카테고리(설계 229)일 때만 그 카테고리 id. 없으면 score 15 패스를 받지 않는다. */
     flexCategoryId?: string | null;
     /** 카드로 내는 항목의 결제수단 — 설계 229 의 '같은 결제 경로' 판정. 없으면 출금계좌로 본다. */
     paymentMethodId?: string | null;
   }[],
   txns: ActualOutflow[],
-  opts?: { earlyDayTolerance?: number }
+  opts?: { earlyDayTolerance?: number; todayDay?: number }
 ): Map<string, ActualOutflow> {
   const result = new Map<string, ActualOutflow>();
   const used = new Array(txns.length).fill(false);
@@ -297,15 +380,13 @@ export function matchOutflowActuals(
   //   거래 타입 제외만으로는 대출 보호가 새기 때문에 항목 쪽에서 판정한다.
   const blindAmounts = new Set(items.filter((i) => i.accountBlind).map((i) => i.amount));
 
-  const cpHitOf = (label: string, counterparty: string | null) => {
-    const nl = normLabel(label);
-    const cp = normLabel(counterparty ?? "");
-    return (
-      cp.length >= 2 &&
-      nl.length >= 2 &&
-      (nl.includes(cp.slice(0, Math.min(4, cp.length))) || cp.includes(nl.slice(0, Math.min(4, nl.length))))
-    );
-  };
+  const cpHitOf = outflowCounterpartyHit;
+
+  // ★설계 216: 0패스(loan_id)는 **대출 아닌 항목이 자기 것으로 주장하는 거래**를 건드리지 않는다.
+  //   같은 대출을 대출 원장과 정기지출 양쪽에 등록한 경우, 금액 차이에만 기대면 월납이 조금만 움직여도
+  //   대출 항목이 정기지출 몫을 가로채 두 번 계산된다. 정기지출이 정확금액이거나 상호+근사로 잡는 거래면
+  //   0패스 후보에서 빼고 종전 패스에 맡긴다 — 금액이 아니라 구조로 막는다.
+  const claimedByNonLoan = txns.map((t) => items.some((o) => !o.loanId && claimsOutflow(o, t)));
 
   // ★설계 229: 같은 카테고리·같은 결제 경로의 변동금액 항목이 **둘 이상**이면 score 15 는 어느 항목의 거래인지
   //   증명하지 못한다(상호·금액을 안 보므로 금액 큰 항목이 먼저 가져간다). 그런 항목은 변동금액 패스에서 빼고
@@ -328,13 +409,14 @@ export function matchOutflowActuals(
       let bestIdx = -1;
       let bestScore = 0;
       let bestDiff = Infinity;
+      let bestGap = Infinity;
       for (let i = 0; i < txns.length; i++) {
         if (used[i]) continue;
         const t = txns[i];
         const exact = t.amount === it.amount;
         const cpHit = cpHitOf(it.label, t.counterparty);
         const approx = Math.abs(t.amount - it.amount) <= Math.max(1000, it.amount * 0.3);
-        // 근사-정밀: 변동금리로 월납이 몇십~몇백 원 흔들리는 대출용(1,000원 또는 0.5% 이내).
+        // 근사-정밀(1,000원 또는 0.5% 이내) — payment 특례(10) 전용. loan_id 짝은 아래 loanNear(설계 219)를 쓴다.
         const nearExact = Math.abs(t.amount - it.amount) <= Math.max(1000, it.amount * 0.005);
         // ★설계 188: 정확금액 단독 매칭(옛 score 3)을 계좌로 세분한다 — 같은 계좌(36) >
         //   계좌 미상·다른 계좌(33·30, 이 서열은 한 항목이 거래를 고를 때만 작동한다).
@@ -354,7 +436,18 @@ export function matchOutflowActuals(
             ? (it.accountId === txnAcc ? 6 : 0)
             : 3;
         let score = 0;
-        if (exact && cpHit) score = 40;
+        // ★설계 216: 장부에서 이 대출로 연결된(loan_id) 상환이 허용폭 안이면 무엇보다 먼저 받는다. 대출 이름과
+        //   거래 상호가 달라 자기 상환을 못 받고, 금액만 같은 남의 소액 거래를 가져가는 일을 막는다.
+        //   ★금액 허용폭 조건을 빼지 마라 — 같은 대출이 정기지출에도 등록돼 있으면 같은 loan_id 거래를 두고 겹친다.
+        //   허용폭은 첫 방어선이고 구조 방어는 위 claimedByNonLoan 이다.
+        //   ★score 50 은 날짜 가드를 면제받지 않는다 — loan_id 는 '어느 대출'만 증명하고 '어느 달 몫'은 증명하지
+        //   못한다. 월말 예정 상환이 다음 달 1일로 밀려 나가면, 면제 시 그게 다음 달 항목의 '출금됨'을 켠다.
+        //   ★설계 219: loan_id 짝만 허용폭을 max(1,000원, 5%)로 넓힌다 — 변동금리로 월납이 바뀐 첫 달과, 예정이
+        //   직전 실제액(±3% 안에서 바뀜)인데 이번 달 실제가 반대로 흔들린 경우를 받으려고.
+        const loanNear = Math.abs(t.amount - it.amount) <= Math.max(1000, it.amount * LOAN_ID_MATCH_RATE);
+        const loanHit = !!(it.loanId && t.loan_id && it.loanId === t.loan_id && loanNear && !claimedByNonLoan[i]);
+        if (loanHit) score = 50;
+        else if (exact && cpHit) score = 40;
         else if (exact) score = 30 + accScore;
         else if (cpHit && approx) score = 20;
         // ★설계 229: 통신비처럼 소액결제로 금액이 크게 달라지는 항목 — 같은 카테고리 + 같은 결제 경로면 금액 1/4~4배 안에서 받는다.
@@ -369,24 +462,33 @@ export function matchOutflowActuals(
           t.amount * VARIABLE_AMOUNT_MAX_RATIO >= it.amount &&
           t.amount <= it.amount * VARIABLE_AMOUNT_MAX_RATIO
         ) score = 15;
-        else if (t.type === "payment" && (cpHit || nearExact)) score = 10;
+        // payment 특례도 대출 항목이면 정기지출이 주장하는 거래를 받지 않는다(설계 216) — 최근 3개월 풀에 같은 대출
+        //   상환이 여러 달 있으면, 정기지출이 한 달치를 받고 남은 달치를 대출 항목이 근사-정밀로 가져가 둘 다 예측에 든다.
+        else if (t.type === "payment" && (cpHit || nearExact) && !(it.loanId && claimedByNonLoan[i])) score = 10;
         if (score < minScore) continue;
         // 계좌 게이트(설계 166) — payment 가 금액 불일치로 붙을 땐 출금계좌가 서로 달라선 안 된다.
         // 계좌를 모르는 쪽이 있으면 판정하지 않는다(등록값이 낡았을 수 있어 막지 않는 쪽이 안전).
         if (t.type === "payment" && score > 0 && score < 30) {
           if (it.accountId && txnAcc && it.accountId !== txnAcc) continue;
         }
-        // 예정일보다 한참 이른 거래는 그 항목의 것이 아니다(상호까지 맞는 score 40 은 예외).
+        // 예정일보다 한참 이른 거래는 그 항목의 것이 아니다(상호까지 맞는 score 40 만 예외 — 50 은 가드를 받는다, 설계 216).
+        const guarded = score !== 40;
         const tol = opts?.earlyDayTolerance;
-        if (tol != null && score < 40 && it.day != null) {
+        if (tol != null && guarded && it.day != null) {
           const txnDay = Number(t.txn_date.slice(8, 10));
           if (Number.isFinite(txnDay) && txnDay < it.day - tol) continue;
         }
+        // 예정일이 아직 안 왔으면 상호까지 맞는 짝만(설계 212). loan_id 짝(50)도 예정일 전엔 붙지 않는다(설계 216).
+        if (opts?.todayDay != null && it.day != null && it.day > opts.todayDay && guarded) continue;
         const diff = Math.abs(t.amount - it.amount);
-        if (score > bestScore || (score === bestScore && diff < bestDiff)) {
+        const txnDayNum = Number(t.txn_date.slice(8, 10));
+        // 일자를 못 읽는 거래는 동점 비교에서 이기지 않게 Infinity. 예정일 없는 항목은 0 — 종전 순서.
+        const gap = it.day == null ? 0 : Number.isFinite(txnDayNum) ? Math.abs(txnDayNum - it.day) : Infinity;
+        if (score > bestScore || (score === bestScore && (diff < bestDiff || (diff === bestDiff && gap < bestGap)))) {
           bestScore = score;
           bestIdx = i;
           bestDiff = diff;
+          bestGap = gap;
         }
       }
       if (bestIdx < 0) continue;
@@ -395,6 +497,7 @@ export function matchOutflowActuals(
     }
   };
 
+  pass(50); // 0패스: 자기 대출에 연결된 상환(loan_id + 허용폭 5% + 정기지출이 주장하지 않는 거래) — 설계 216·219
   pass(40); // 1패스: 정확금액 + 상호일치만
   pass(36); // 1.5패스: 정확금액 + 출금계좌 일치 — 배열 뒤(보류) 항목이라도 자기 계좌 거래를 먼저 받는다(설계 188)
   pass(20); // 2패스: 나머지(정확금액 단독, 근사+상호일치)

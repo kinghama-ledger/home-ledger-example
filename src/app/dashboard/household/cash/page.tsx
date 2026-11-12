@@ -21,12 +21,14 @@ import { HH_TAB_SUB } from "@/components/household/hh-tab-styles";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { usePrivacyMode } from "@/components/privacy/privacy-mode";
 import { browserDb } from "@/lib/backend/browser";
+import { maskNamesIn } from "@/lib/privacy/mask";
 import { formatManwon } from "@/lib/household/won-format";
 import { getOwnerUid } from "@/lib/household/owner";
 import { accountTintMap, ACCOUNT_TINT_NONE, CARD_TINT } from "@/lib/household/account-color";
 import { useHideInactiveAccounts, visibleAccounts as pickVisibleAccounts } from "@/lib/household/account-visibility";
-import { CALENDAR_KIND_META, outflowsForMatching, projectedBalances, variableAmountCategoryIds, type ActualOutflow } from "@/lib/household/calc";
+import { CALENDAR_KIND_META, clampDayToMonth, outflowsForMatching, projectedBalances, variableAmountCategoryIds, type ActualOutflow } from "@/lib/household/calc";
 import { buildVariableSpendInput, fixedCategoryIdsOf, variableSpendOfMonth, type VariableSpendSample } from "@/lib/household/variable-spend";
+import { fetchVariableSpendSamples } from "@/lib/household/variable-spend-fetch";
 import { seoulToday } from "@/lib/household/sms";
 import { cardGroupOf } from "@/lib/household/card-group";
 import { cashflowSnapshot, computeCashMatches, RELEASE_REASON_LABEL, type ClassifiedItem, type NextOutItem, type OutItem } from "@/lib/household/cashflow-snapshot";
@@ -189,70 +191,6 @@ type ReportedBalanceRow = {
 };
 
 /**
- * 변동 지출 표본 + 전월 실적 — **완료된 직전 3개월**. (설계 173)
- *
- * ★변동 지출은 **정기지출이 쓰지 않는 카테고리의 통장 지출**로 센다.
- *   `실제 유출 − 그 달 정기 예정`으로는 못 잡는다 —
- *   정기지출·대출은 "현재" 상태만 저장돼 있어 **과거 달의 예정을 재현할 수 없기** 때문이다
- *   (차액이 실제 유출 전액이 된다). 자세한 근거는 `variableSpendOfMonth` 주석.
- * ★실제 유출은 `outflowsForMatching` 으로 **내부 이체·카드 지출을 뺀** 뒤 센다 — 화면 합계와 같은 기준.
- */
-async function fetchVariableSpendSamples(
-  supabase: ReturnType<typeof browserDb>,
-  month: string,
-  base: { scheduled: HhScheduledPayment[]; methods: HhPaymentMethod[]; accountIds: string[] },
-): Promise<{ samples: VariableSpendSample[]; prev: { ym: string; income: number; outflow: number } | null }> {
-  const months = [3, 2, 1].map((k) => shiftMonth(month, -k)); // 완료된 직전 3개월(당월 제외)
-  const prevYm = shiftMonth(month, -1);
-  const from = `${months[0]}-01`;
-  const to = monthRange(month).start; // 당월 시작 = 표본 구간의 끝
-  // ★페이징 — 3개월치 전 유형이면 상한 1,000행을 넘길 수 있고, 잘리면 **조용히 과소 집계**된다
-  //   (설계 128 후속에서 같은 함정을 밟았다). 실패는 null 로 알려 '0원'과 구분한다.
-  const txns: HhTransaction[] = [];
-  for (let off = 0; off < 50_000; off += 1000) {
-    const { data, error } = await supabase
-      .from("hh_transaction")
-      .select("*")
-      .in("type", ["expense", "income", "payment", "transfer"])
-      .gte("txn_date", from)
-      .lt("txn_date", to)
-      .order("txn_date", { ascending: true })
-      .order("id", { ascending: true })
-      .range(off, off + 999);
-    if (error) {
-      console.error("변동지출 표본 조회 실패:", error);
-      return { samples: [], prev: null };
-    }
-    const rows = (data ?? []) as HhTransaction[];
-    txns.push(...rows);
-    if (rows.length < 1000) break;
-  }
-  const fixedCats = fixedCategoryIdsOf(base.scheduled);
-  const cardIds = base.methods.filter((m) => m.kind === "credit" || m.kind === "installment").map((m) => m.id);
-  // ★수입을 먼저 뺀다 — outflowsForMatching 은 내부이체·카드지출만 거르고 income 은 그대로 통과시킨다.
-  //   안 빼면 전월 '출금'에 수입이 더해져 실제보다 크게 나온다.
-  const outTxns = txns.filter((t) => t.type !== "income") as unknown as ActualOutflow[];
-  const pool = outflowsForMatching(outTxns, base.accountIds, cardIds);
-
-  // ★표본도 **pool**(내부이체·신용/할부 카드지출 제외)로 센다 — 원본 txns 로 세면 카드 지출이 섞여
-  //   카드대금 예정과 **이중계상**된다(교차리뷰 2026-08-14).
-  // ★거래가 아예 없는 달은 표본에서 뺀다 — 0원 표본이 섞이면 중앙값이 0 쪽으로 끌려가
-  //   진짜 실적 월이 '이상치'로 제외되고 월평균이 0이 된다(같은 리뷰).
-  const poolAll = pool as unknown as HhTransaction[];
-  const samples = months
-    .filter((ym) => txns.some((t) => t.txn_date.slice(0, 7) === ym))
-    .map((ym) => ({ ym, amount: variableSpendOfMonth(poolAll, ym, fixedCats) }));
-  // 전월 실적(확정) — 최상단 요약에서 이번 달 예상과 나란히 놓는다. (설계 173 ③)
-  // ★출금 기준을 이번 달과 **같게** 맞춘다: 내부 이체·카드 지출을 뺀 실제 통장유출.
-  const prev = {
-    ym: prevYm,
-    income: txns.filter((t) => t.type === "income" && t.txn_date.slice(0, 7) === prevYm).reduce((s2, t) => s2 + Number(t.amount), 0),
-    outflow: pool.filter((t) => t.txn_date.slice(0, 7) === prevYm).reduce((s2, t) => s2 + Number(t.amount), 0),
-  };
-  return { samples, prev };
-}
-
-/**
  * 문자·알림이 알려준 계좌 잔액 전량 로드(설계 71). 실패하면 null.
  *
  * ★페이징 필수 — 예전엔 페이징 없이 select 해서 1,000행 상한에 걸렸다.
@@ -314,10 +252,11 @@ async function fetchRecentOutflows(
   for (let from = 0; from < MAX; from += CHUNK) {
     const { data, error } = await supabase
       .from("hh_transaction")
-      // 계좌·수단 컬럼은 전월 '계좌별 실출금'(설계 127) 계산용 — 매칭(ActualOutflow)은 앞 3개만 쓴다.
+      // 계좌·수단 컬럼은 전월 '계좌별 실출금'(설계 127) 계산용 — 매칭(ActualOutflow)도 계좌·수단을 풀 거르기·계좌 게이트에 쓴다(설계 131·166).
       // to_account_id 는 내부 이체 판정용(설계 128) — 빠지면 전월 열만 내 통장끼리의 이동을 실출금으로 남긴다.
       // category_id 는 변동금액(통신비) 매칭용(설계 229) — 홈(household-summary)도 같이 넘긴다(설계 79).
-      .select("amount,counterparty,txn_date,type,account_id,from_account_id,to_account_id,payment_method_id,category_id")
+      // loan_id 는 대출 항목이 자기 상환을 먼저 받는 0패스용(설계 216) — 홈(household-summary)도 같이 넘긴다(설계 79).
+      .select("amount,counterparty,txn_date,type,account_id,from_account_id,to_account_id,payment_method_id,category_id,loan_id")
       .in("type", ["expense", "payment", "transfer"])
       .gte("txn_date", fromDate)
       .lt("txn_date", toDate)
@@ -404,16 +343,14 @@ export default function HouseholdCashPage() {
   const personName = useCallback((id: string | null) => persons.find((p) => p.id === id)?.name ?? "-", [persons]);
   const categoryName = useCallback((id: string | null) => (id ? categories.find((c) => c.id === id)?.name ?? null : null), [categories]);
   // 텍스트 어디에 박혀 있든(괄호·하이픈·단독) 인물명을 가명으로. 출금예정 항목명("현대카드-이바다")·select 옵션 등. (설계 docs/household/39)
+  // 바꾸는 규칙은 대출관리·설정 화면과 함께 쓰는 공용 함수(maskNamesIn)에 있다.
+  const personNames = useMemo(() => persons.map((p) => p.name), [persons]);
   const maskOwnerText = useCallback(
-    (s: string | null | undefined): string => {
-      if (s == null) return "";
-      if (!maskEnabled) return s;
-      let out = s;
-      for (const p of persons) if (p.name) out = out.split(p.name).join(mask("name", p.name));
-      return out;
-    },
-    [maskEnabled, persons, mask]
+    (s: string | null | undefined): string => maskNamesIn(s, personNames, maskEnabled),
+    [maskEnabled, personNames]
   );
+  // 가림 모드의 금액 입력칸 — 가짜 금액을 읽기 전용으로 보인다(AmountInput 과 같은 방식). 빈 칸은 빈 칸 그대로다.
+  const maskInputAmount = (shown: string) => (maskEnabled ? mask("expense_amount", shown) : shown);
 
   // 조회 초기화 — 기간=이번 달 전체, 출금계좌=전체.
   const resetFilters = useCallback(() => {
@@ -597,6 +534,8 @@ export default function HouseholdCashPage() {
     totalCash,
     horizon,
     variableSpend: variableSpend.input,
+    // 예정일 전 항목은 상호까지 맞는 거래만 '출금됨'(설계 212).
+    today: todayYmd,
     variableAmountCategoryIds: flexCategoryIds,
   });
   const { nextMonth, nextOutTotal, nextForecastOut } = snap;
@@ -634,7 +573,8 @@ export default function HouseholdCashPage() {
   // 카드로 결제되는 고정비는 그날 통장에서 안 빠진다(카드대금일에 함께 나감) → 현금 합계·잔액 계산에서 제외. (설계 108)
   const filteredCashOut = filteredActive.filter((i) => !i.cardCharge);
   const paidOut = filteredCashOut.reduce((s, i) => s + (i.paidAmount ?? 0), 0); // 이미 지급됨
-  const pendingOut = filteredCashOut.reduce((s, i) => s + (i.paidAmount ? 0 : i.amount), 0); // 아직 안 나감(예상). 출금금액 비움/0 = 미출금
+  // 아직 안 나감(예상). 출금금액 비움/0 = 미출금. 부분 납부한 카드대금은 남은 금액만(설계 218 — 스냅샷 pendingOutAll 과 같은 식, 필터 없으면 같은 값).
+  const pendingOut = filteredCashOut.reduce((s, i) => s + i.remainingAmount, 0);
   const cardChargeCount = filteredActive.length - filteredCashOut.length;
   // 익월 탭도 같은 안내가 필요하다 — 행에는 카드결제가 보이는데 합계에선 빠지기 때문. (설계 108 교차리뷰)
   const nextCardChargeCount = nextActiveItems.filter((i) => i.cardCharge).length;
@@ -656,6 +596,7 @@ export default function HouseholdCashPage() {
     recentOutflows,
     accounts,
     methods,
+    today: todayYmd,
     variableAmountCategoryIds: flexCategoryIds,
   });
   // 표 하단 합계용 — 표시 중인(필터 반영) 행의 전월 매칭 합. 카드 행 결제 매칭은 통장 출금이
@@ -672,6 +613,16 @@ export default function HouseholdCashPage() {
     },
     [methodById, accounts]
   );
+  // 자동 매칭된 당월 거래가 항목 출금계좌와 **다른 계좌**에서 나갔으면 그 계좌 이름(설계 209).
+  // 정확금액 짝은 계좌가 달라도 막지 않고 순위만 낮춘다(설계 188) — 그래서 우연히 금액이 같은 남의 거래가
+  // 붙을 수 있다. 막는 대신 사람 눈에 띄게만 한다. 계좌 판정은 매처와 같은 순서.
+  const otherAccountPaid = (i: ClassifiedItem): string | null => {
+    if (i.cardCharge || i.paidOverride != null || !i.accountId) return null;
+    const t = snap.paidThisMonth.get(i.key);
+    const txnAcc = t ? (t.from_account_id ?? t.account_id) : null;
+    if (!txnAcc || txnAcc === i.accountId) return null;
+    return accounts.find((a) => a.id === txnAcc)?.name ?? "다른 계좌";
+  };
 
   // 카테고리 인라인 드롭다운 옵션 — 지출 카테고리(활성)만. 조회 순서(sort_order→name) 유지.
   const expenseCategories = categories.filter((c) => c.kind === "expense" && c.is_active);
@@ -689,13 +640,14 @@ export default function HouseholdCashPage() {
   })();
   const outflowByCategoryTotal = outflowByCategory.reduce((s, d) => s + d.amount, 0);
 
-  // 계좌별 누적 차감 예상잔액 — 활성 항목 중 '미지급'만 예상금액으로 차감(지급분은 잔액에 이미 반영됨, 이중차감 방지).
+  // 계좌별 누적 차감 예상잔액 — 활성 항목의 남은 금액(remainingAmount)만 차감(지급분은 잔액에 이미 반영됨, 이중차감 방지).
   // 카드 결제분은 계좌에서 그날 안 빠지므로 차감 대상이 아니다(카드대금 항목이 대표). (설계 108)
   const projected = projectedBalances(
     balances,
     activeItems
       .filter((i) => !i.cardCharge)
-      .map((i) => ({ key: i.key, accountId: i.accountId, amount: i.paidAmount ? 0 : i.amount, day: i.day }))
+      // 부분 납부한 카드대금은 남은 금액이 예정일에 빠진다(설계 218).
+      .map((i) => ({ key: i.key, accountId: i.accountId, amount: i.remainingAmount, day: i.day }))
   );
 
   // 상단 요약: 출금예정(미지급)/출금액(이미 지급) — 공유 스냅샷 값(현황과 동일, 설계 79).
@@ -1025,7 +977,7 @@ export default function HouseholdCashPage() {
   const firstRiskIdx = projection.findIndex((p) => p.closingCash < bufferLine);
   const firstRisk = firstRiskIdx >= 0 ? projection[firstRiskIdx] : null;
   const nowYm = thisMonthKey();
-  const bufferInputValue = bufferDraft != null ? (bufferDraft === "" ? "" : Number(bufferDraft).toLocaleString("ko-KR")) : bufferLine.toLocaleString("ko-KR");
+  const bufferInputValue = maskInputAmount(bufferDraft != null ? (bufferDraft === "" ? "" : Number(bufferDraft).toLocaleString("ko-KR")) : bufferLine.toLocaleString("ko-KR"));
 
   // 금액(잔액·지출·출금액·출금예정 중 하나라도)이 있는 계좌만 먼저 펼쳐 보이고, 전부 빈 계좌는 더보기로 접는다.
   // ⚠️ 이체 참여도 '활동'으로 센다(설계 128) — 내부 이체를 실출금에서 빼면서 withdrawnByAccount 가
@@ -1119,13 +1071,15 @@ export default function HouseholdCashPage() {
         .select("id")
         .single();
       if (insErr) { toast.error(`추가 실패: ${insErr.message}`); return; }
-      if (data.direction === "out" && data.pay_day != null && inserted?.id) {
-        await saveOverride("fixed", inserted.id, { day_override: data.pay_day });
+      // ★매주(weekly)의 pay_day 는 요일(0~6)이라 날짜 확정으로 넣으면 안 된다 — 0 은 저장이 막히고, 1~6 은 그달 1~6일 출금으로 잡힌다.
+      if (data.direction === "out" && data.frequency !== "weekly" && data.pay_day != null && inserted?.id) {
+        // ★day_override 는 화면에서 말일로 맞춰지지 않는다 — 31(=말일)을 그대로 넣으면 30일·2월 달에 없는 날짜가 된다.
+        await saveOverride("fixed", inserted.id, { day_override: clampDayToMonth(data.pay_day, month) });
       }
       toast.success("정기지출을 추가했습니다. 이번 달 출금 예정에 반영됩니다.");
       await fetchData();
     },
-    [ownerUid, supabase, saveOverride, fetchData]
+    [ownerUid, supabase, saveOverride, fetchData, month]
   );
 
   // 정기지출 저장 — 다이얼로그에 target이 있으면 그 항목의 원본 세부 내용을 수정, 없으면 신규 추가.
@@ -1238,7 +1192,7 @@ export default function HouseholdCashPage() {
   const amountDisplay = (i: OutItem) => {
     const raw = amountDraft[i.key];
     const n = raw != null ? Number(raw) : i.amount;
-    return Number.isNaN(n) ? "" : n.toLocaleString("ko-KR");
+    return Number.isNaN(n) ? "" : maskInputAmount(n.toLocaleString("ko-KR"));
   };
   const commitAmount = (i: OutItem) => {
     const raw = (amountDraft[i.key] ?? "").trim();
@@ -1251,9 +1205,9 @@ export default function HouseholdCashPage() {
   // 출금금액 표시값 — 편집 중이면 draft, 아니면 수기값/자동매칭. 명시적으로 비운 값(paid_override=0)은 공란.
   const paidDisplay = (i: ClassifiedItem) => {
     const raw = paidDraft[i.key];
-    if (raw != null) return raw === "" ? "" : Number(raw).toLocaleString("ko-KR");
+    if (raw != null) return raw === "" ? "" : maskInputAmount(Number(raw).toLocaleString("ko-KR"));
     if (i.paidOverride === 0) return ""; // 사용자가 비운 값 → 공란 유지(자동매칭으로 되돌아가지 않음)
-    return i.paidAmount ? i.paidAmount.toLocaleString("ko-KR") : "";
+    return i.paidAmount ? maskInputAmount(i.paidAmount.toLocaleString("ko-KR")) : "";
   };
   // 출금금액 커밋 — 입력하거나 지우면 그대로 저장(빈 값=0=미출금). 값이 바뀐 경우에만 저장.
   const commitPaid = (i: ClassifiedItem) => {
@@ -1281,7 +1235,7 @@ export default function HouseholdCashPage() {
   const nextAmountDisplay = (i: NextOutItem) => {
     const raw = nextAmountDraft[i.key];
     const n = raw != null ? Number(raw) : i.amount;
-    return Number.isNaN(n) ? "" : n.toLocaleString("ko-KR");
+    return Number.isNaN(n) ? "" : maskInputAmount(n.toLocaleString("ko-KR"));
   };
   // 익월 금액 커밋 — 비우면 오버라이드를 지워 당월 기준값(baseAmount)으로 되돌아간다.
   const commitNextAmount = (i: NextOutItem) => {
@@ -1357,8 +1311,9 @@ export default function HouseholdCashPage() {
         const curOut = curMonthOut;
         const curNet = curIn - curOut;
         const cell = (v: number, positive?: boolean) => (
-          <span className={`font-semibold tabular-nums ${positive === undefined ? "" : v < 0 ? "text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400"}`}>
-            {won(v)}
+          // 가림 모드에서는 가짜 금액으로, 부호와 색(흑자·적자)도 드러내지 않는다 — 아래 예측 표와 같은 방식.
+          <span className={`font-semibold tabular-nums ${positive === undefined || maskEnabled ? "" : v < 0 ? "text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400"}`}>
+            {mask("expense_amount", won(maskEnabled ? Math.abs(v) : v))}
           </span>
         );
         return (
@@ -1388,8 +1343,8 @@ export default function HouseholdCashPage() {
               {vsEnabled ? (
                 <>
                   <span>
-                    월 <strong className="text-foreground tabular-nums">{won(variableSpend.input.monthly)}</strong>
-                    {" · "}이번 달 남은 몫 <strong className="text-foreground tabular-nums">{won(variableSpend.input.firstMonth)}</strong>
+                    월 <strong className="text-foreground tabular-nums">{mask("expense_amount", won(variableSpend.input.monthly))}</strong>
+                    {" · "}이번 달 남은 몫 <strong className="text-foreground tabular-nums">{mask("expense_amount", won(variableSpend.input.firstMonth))}</strong>
                   </span>
                   <span>
                     (근거: {variableSpend.estimate.used.map((u) => u.ym).join("·") || "표본 없음"} 평균
@@ -1401,7 +1356,8 @@ export default function HouseholdCashPage() {
                       type="number"
                       className="w-28 rounded-md border border-border/60 bg-background px-2 py-0.5 text-right text-base md:text-xs"
                       placeholder="자동"
-                      value={vsOverride ?? ""}
+                      value={maskEnabled ? "" : vsOverride ?? ""}
+                      readOnly={maskEnabled}
                       onChange={(e) => {
                         const raw = e.target.value === "" ? null : Number(e.target.value);
                         // 유한하고 0 이상인 값만 받는다 — Infinity/음수가 예측에 들어가면 숫자가 통째로 깨진다.
@@ -1506,7 +1462,7 @@ export default function HouseholdCashPage() {
                       <tr key={a.id} className="border-b border-border/40 last:border-0 transition-colors hover:bg-muted/30 [&>td]:py-1">
                         {/* title도 마스킹을 거친다 — 원본이면 마스킹 모드에서 툴팁으로 실명이 새어나간다(코드리뷰 지적). */}
                         <td className="px-4 py-3 font-medium text-foreground" title={maskOwnerText(a.name)}>{accountCell(a)}</td>
-                        <td className="truncate px-4 py-3 tabular-nums text-xs text-muted-foreground" title={a.account_no?.trim() ? a.account_no : undefined}>{a.account_no?.trim() ? a.account_no : "-"}</td>
+                        <td className="truncate px-4 py-3 tabular-nums text-xs text-muted-foreground" title={a.account_no?.trim() ? mask("account_no", a.account_no) : undefined}>{a.account_no?.trim() ? mask("account_no", a.account_no) : "-"}</td>
                         <td className="truncate px-4 py-3 text-right tabular-nums text-foreground">{mask("amount", won(balances[a.id] ?? 0))}</td>
                         {/* 전월은 참고값이라 회색 — 이번 달(진한 색)과 눈으로 갈리게. (설계 127) */}
                         <td className="truncate px-4 py-3 text-right tabular-nums text-muted-foreground">{prevWithdrawnByAccount[a.id] ? mask("expense_amount", won(prevWithdrawnByAccount[a.id])) : "-"}</td>
@@ -1557,7 +1513,7 @@ export default function HouseholdCashPage() {
                     </div>
                     <div className="mt-1 flex flex-wrap gap-x-3 text-xs text-muted-foreground">
                       <span>{mask("name", personName(a.person_id))}</span>
-                      {a.account_no?.trim() ? <span className="tabular-nums">{a.account_no}</span> : null}
+                      {a.account_no?.trim() ? <span className="tabular-nums">{mask("account_no", a.account_no)}</span> : null}
                     </div>
                     <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs">
                       <span className="text-muted-foreground">실출금(전월) <span className="tabular-nums">{prevWithdrawnByAccount[a.id] ? mask("expense_amount", won(prevWithdrawnByAccount[a.id])) : "-"}</span></span>
@@ -1594,7 +1550,8 @@ export default function HouseholdCashPage() {
           <FoldSection
             id="outflow"
             title="당월 출금 예정"
-            description="전월에 실제 나간 금액(전월 출금)·예상금액·이번 달 실제 출금금액을 나란히 대조하고, 그 옆에 각 항목 출금계좌의 잔액(감당 못하면 부족액)을 함께 봅니다 — 부족액은 아직 안 나간(날짜 안 지난) 미출금만으로 계산합니다. 출금계좌 칸 색은 소유자 구분입니다(파랑=김하늘, 주황=이바다, 회색=카드 — 카드는 그날 통장에서 안 빠집니다). 출금금액은 직접 입력·삭제 가능(비우면 미출금), 항목명을 클릭하면 세부 내용(이름·금액·카테고리·납부일·명의 등)을 수정할 수 있습니다. 위 조회바에서 출금계좌를 하나 고르면 그 통장의 누적 '출금 후 잔액' 흐름으로 바뀝니다. 날짜 확인이 필요하거나 최근 출금 기록이 없던 항목은 '이번 달 쉼' 탭으로 빠집니다. '익월 출금' 탭에서는 당월 출금금액을 기본값으로 가져와 카드값처럼 매달 바뀌는 금액을 미리 확정해 둘 수 있습니다."
+            // 소유자 색 안내에 사람 이름이 들어 있다 — 가림 모드에서는 이름을 바꿔 보인다.
+            description={maskOwnerText("전월에 실제 나간 금액(전월 출금)·예상금액·이번 달 실제 출금금액을 나란히 대조하고, 그 옆에 각 항목 출금계좌의 잔액(감당 못하면 부족액)을 함께 봅니다 — 부족액은 아직 안 나간(날짜 안 지난) 미출금만으로 계산합니다. 출금계좌 칸 색은 소유자 구분입니다(파랑=김하늘, 주황=이바다, 회색=카드 — 카드는 그날 통장에서 안 빠집니다). 출금금액은 직접 입력·삭제 가능(비우면 미출금), 항목명을 클릭하면 세부 내용(이름·금액·카테고리·납부일·명의 등)을 수정할 수 있습니다. 위 조회바에서 출금계좌를 하나 고르면 그 통장의 누적 '출금 후 잔액' 흐름으로 바뀝니다. 날짜 확인이 필요하거나 최근 출금 기록이 없던 항목은 '이번 달 쉼' 탭으로 빠집니다. '익월 출금' 탭에서는 당월 출금금액을 기본값으로 가져와 카드값처럼 매달 바뀌는 금액을 미리 확정해 둘 수 있습니다.")}
             headerAction={
               <Button variant="outline" size="sm" className="shrink-0" onClick={() => setSpDialog({ open: true, target: null })}>
                 <Plus className="h-4 w-4" /> 항목 추가
@@ -1646,7 +1603,7 @@ export default function HouseholdCashPage() {
                           <tr><td colSpan={10} className="px-4 py-10 text-center text-sm text-muted-foreground">선택한 기간({effStart}~{effEnd}일)에 출금 예정이 없습니다.</td></tr>
                         ) : filteredActive.map((i) => {
                           const past = i.day != null && i.day < todayDay;
-                          const paid = !!i.paidAmount;
+                          const paid = !!i.paidAmount && !i.paidPartial; // 부분 납부는 아직 나갈 돈이 남았다(설계 218)
                           // 지난 날짜는 흐리게만 한다. ★`grayscale` 을 쓰지 마라 — CSS filter 라
                           // 자손 전부의 채도를 없애 계좌별 색(설계 126)이 통째로 죽는다. 달 후반에는
                           // 대부분의 행이 past 라 색 구분이 사실상 사라진다(교차리뷰 2026-08-02 지적).
@@ -1741,6 +1698,7 @@ export default function HouseholdCashPage() {
                                   type="text"
                                   inputMode="numeric"
                                   value={amountDisplay(i)}
+                              readOnly={maskEnabled}
                                   onChange={(e) => setAmountDraft((d) => ({ ...d, [i.key]: e.target.value.replace(/[^\d]/g, "") }))}
                                   onBlur={() => commitAmount(i)}
                                   className="w-full rounded-md border border-border/60 bg-background px-2 py-1 text-right tabular-nums text-base md:text-[0.8rem]"
@@ -1760,13 +1718,30 @@ export default function HouseholdCashPage() {
                                     type="text"
                                     inputMode="numeric"
                                     value={paidDisplay(i)}
+                              readOnly={maskEnabled}
                                     onChange={(e) => setPaidDraft((d) => ({ ...d, [i.key]: e.target.value.replace(/[^\d]/g, "") }))}
                                     onBlur={() => commitPaid(i)}
                                     placeholder="-"
                                     title="실제 출금금액. 자동 매칭값이 채워지며, 직접 입력하거나 비우면(=미출금) 그대로 저장됩니다."
-                                    className="w-full rounded-md border border-border/60 bg-background px-2 py-1 text-right tabular-nums text-base font-medium text-foreground placeholder:font-sans placeholder:font-normal placeholder:text-muted-foreground md:text-[0.8rem]"
+                                    className={`w-full rounded-md border ${otherAccountPaid(i) ? "border-amber-500" : "border-border/60"} bg-background px-2 py-1 text-right tabular-nums text-base font-medium text-foreground placeholder:font-sans placeholder:font-normal placeholder:text-muted-foreground md:text-[0.8rem]`}
                                   />
                                 )}
+                                {otherAccountPaid(i) ? (
+                                  <div
+                                    className="mt-0.5 text-[0.7rem] leading-tight text-amber-600"
+                                    title={`${maskOwnerText(otherAccountPaid(i)!)}에서 나간 거래가 자동으로 붙었습니다 — 이 항목의 출금계좌와 다릅니다. 이 항목의 돈이 아니면 출금금액을 비우세요.`}
+                                  >
+                                    다른 계좌
+                                  </div>
+                                ) : null}
+                                {i.paidPartial ? (
+                                  <div
+                                    className="mt-0.5 text-[0.7rem] leading-tight text-amber-600 tabular-nums"
+                                    title="카드대금 일부만 냈습니다 — 남은 금액은 예정일에 나갈 돈으로 계속 잡습니다(설계 218)."
+                                  >
+                                    남음 {mask("expense_amount", won(i.remainingAmount))}
+                                  </div>
+                                ) : null}
                               </td>
                               {/* 출금 후 잔액 = 그 계좌의 그 날짜까지 반영한 누적 잔액(projected). 전체·단일계좌 동일. (설계 104) */}
                               <td className="whitespace-nowrap px-4 py-2.5 text-right tabular-nums">
@@ -1847,7 +1822,7 @@ export default function HouseholdCashPage() {
                       <div className="rounded-xl border border-dashed border-border/70 bg-background/40 p-6 text-center text-sm text-muted-foreground">선택한 기간({effStart}~{effEnd}일)에 출금 예정이 없습니다.</div>
                     ) : filteredActive.map((i) => {
                       const past = i.day != null && i.day < todayDay;
-                      const paid = i.paidAmount != null;
+                      const paid = !!i.paidAmount && !i.paidPartial; // 데스크톱과 같은 기준 — 수기 0(미출금)·부분 납부는 완납 아님(설계 218)
                       // 데스크톱 표와 같은 이유로 grayscale 금지 — 계좌 색이 죽는다. (설계 126)
                       return (
                         <div key={i.key} className={`rounded-xl border bg-card/85 p-2 shadow-sm ${past ? "border-border/70 opacity-60" : paid ? "border-emerald-300/60 bg-emerald-50/20 dark:bg-emerald-950/10" : "border-border/70"}`}>
@@ -1905,6 +1880,7 @@ export default function HouseholdCashPage() {
                               aria-label="예상금액"
                               placeholder="예상금액"
                               value={amountDisplay(i)}
+                              readOnly={maskEnabled}
                               onChange={(e) => setAmountDraft((d) => ({ ...d, [i.key]: e.target.value.replace(/[^\d]/g, "") }))}
                               onBlur={() => commitAmount(i)}
                               className="w-full rounded-md border border-border/60 bg-background px-2 py-1 text-right tabular-nums text-sm"
@@ -1970,11 +1946,15 @@ export default function HouseholdCashPage() {
                                   type="text"
                                   inputMode="numeric"
                                   value={paidDisplay(i)}
+                              readOnly={maskEnabled}
                                   onChange={(e) => setPaidDraft((d) => ({ ...d, [i.key]: e.target.value.replace(/[^\d]/g, "") }))}
                                   onBlur={() => commitPaid(i)}
                                   placeholder="-"
-                                  className="w-20 rounded-md border border-border/60 bg-background px-2 py-1 text-right tabular-nums text-sm font-medium text-foreground placeholder:font-sans placeholder:text-muted-foreground"
+                                  className={`w-20 rounded-md border ${otherAccountPaid(i) ? "border-amber-500" : "border-border/60"} bg-background px-2 py-1 text-right tabular-nums text-sm font-medium text-foreground placeholder:font-sans placeholder:text-muted-foreground`}
                                 />
+                                {/* 설계 209 — 데스크톱과 같은 표시. 한 줄 배치라 계좌 이름은 빼고 짧은 표시만 붙인다. */}
+                                {otherAccountPaid(i) ? <span className="whitespace-nowrap text-[0.65rem] text-amber-600">다른 계좌</span> : null}
+                                {i.paidPartial ? <span className="whitespace-nowrap text-[0.65rem] tabular-nums text-amber-600">남음 {mask("expense_amount", won(i.remainingAmount))}</span> : null}
                               </label>
                             )}
                             <span className="whitespace-nowrap text-right text-[0.7rem] leading-tight">출금 후 잔액 <span className="tabular-nums">
@@ -2110,6 +2090,7 @@ export default function HouseholdCashPage() {
                                 type="text"
                                 inputMode="numeric"
                                 value={nextAmountDisplay(i)}
+                              readOnly={maskEnabled}
                                 onChange={(e) => setNextAmountDraft((d) => ({ ...d, [i.key]: e.target.value.replace(/[^\d]/g, "") }))}
                                 onBlur={() => commitNextAmount(i)}
                                 title="익월에 나갈 금액. 카드값처럼 매달 변하는 값을 직접 입력하세요. 비우면 당월 값으로 되돌아갑니다."
@@ -2184,6 +2165,7 @@ export default function HouseholdCashPage() {
                             aria-label="익월 예상금액"
                             placeholder="익월 예상금액"
                             value={nextAmountDisplay(i)}
+                              readOnly={maskEnabled}
                             onChange={(e) => setNextAmountDraft((d) => ({ ...d, [i.key]: e.target.value.replace(/[^\d]/g, "") }))}
                             onBlur={() => commitNextAmount(i)}
                             className={`w-full rounded-md border bg-background px-2 py-1 text-right tabular-nums text-sm ${i.amountOverridden ? "border-primary/60 font-medium" : "border-border/60"}`}
@@ -2414,6 +2396,7 @@ export default function HouseholdCashPage() {
                   inputMode="numeric"
                   aria-label="여유선 금액"
                   value={bufferInputValue}
+                  readOnly={maskEnabled}
                   onFocus={() => setBufferDraft(String(bufferLine))}
                   onChange={(e) => setBufferDraft(e.target.value.replace(/[^\d]/g, ""))}
                   onBlur={commitBuffer}

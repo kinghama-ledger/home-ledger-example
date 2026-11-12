@@ -487,5 +487,140 @@ console.log("\n[16] 대출 원천 계좌는 매칭 게이트에 안 쓰인다 (�
   eq("잡혔으므로 '최근 실적 없음'으로 사라지지 않는다", loanItem?.reason, null);
 }
 
+// ── 17. 아직 시작 전인 신규 정기지출은 시작월부터 예측한다 (설계 215) ──
+console.log("\n[17] 미래 시작 신규 정기지출은 시작월부터 익월 탭·여러 달 예측에 포함 (설계 215)");
+const instantPay: HhPaymentMethod = {
+  id: "pm-instant", owner_auth_uid: OWNER, name: "합성 즉시출금", kind: "cash",
+  billing_day: null, linked_account_id: "acc-2", is_active: true,
+  sort_order: 0, created_at: "", updated_at: "",
+} as unknown as HhPaymentMethod;
+const futureNextFixed: HhScheduledPayment = {
+  id: "sp-future-next", owner_auth_uid: OWNER, title: "미래시작고정비", kind: "autopay",
+  direction: "out", amount: 6_400, frequency: "monthly", pay_day: 22,
+  account_id: "acc-2", payment_method_id: "pm-instant", category_id: "cat-future",
+  is_active: true, permanent_hold: false, start_date: "2026-08-22", end_date: null,
+  person_id: null, payee: null, created_at: "", updated_at: "",
+} as unknown as HhScheduledPayment;
+const futureLaterFixed: HhScheduledPayment = {
+  ...futureNextFixed,
+  id: "sp-future-later", title: "익익월시작고정비", amount: 13_200, start_date: "2026-09-22",
+};
+const futureCardFixed: HhScheduledPayment = {
+  ...futureNextFixed,
+  id: "sp-future-card", title: "미래시작카드고정비", amount: 8_100,
+  payment_method_id: "pm-card", account_id: null,
+};
+const legacyNoStartFixed: HhScheduledPayment = {
+  ...futureNextFixed,
+  id: "sp-legacy-no-start", title: "시작일없는기존고정비", amount: 9_300, start_date: null,
+};
+
+const snapFutureNext = cashflowSnapshot(MONTH, {
+  ...base,
+  scheduled: [...scheduled, futureNextFixed],
+  methods: [...methods, instantPay],
+  overrides: [], nextOverrides: [],
+});
+const futureNextItem = snapFutureNext.nextItems.find((i) => i.key === "fixed:sp-future-next");
+check("전제: 미래 시작 항목은 당월 classified 에 없다",
+  !snapFutureNext.classified.some((i) => i.key === "fixed:sp-future-next"));
+check("전제: 최근 실적도 없다", !snapFutureNext.paidRecently.has("fixed:sp-future-next"));
+eq("a) 시작월인 익월에는 no-recent 없이 예정", futureNextItem?.reason, null);
+eq("a) 시작월인 익월 예측에 포함", futureNextItem?.inForecast, true);
+eq("a) 익월 탭 합계에 신규 6,400원 포함", snapFutureNext.nextOutTotal, snapA.nextOutTotal + 6_400);
+eq("b) 익월 이후 예측에도 신규 6,400원 포함",
+  snapFutureNext.projection[2].outflow, snapA.projection[2].outflow + 6_400);
+
+const snapFutureLater = cashflowSnapshot(MONTH, {
+  ...base,
+  scheduled: [...scheduled, futureNextFixed, futureLaterFixed],
+  methods: [...methods, instantPay],
+  overrides: [], nextOverrides: [],
+});
+check("b) 익익월 시작 항목은 익월 탭에 아직 없다",
+  !snapFutureLater.nextItems.some((i) => i.key === "fixed:sp-future-later"));
+eq("b) 익익월 시작 항목은 익월 예측에도 아직 없다",
+  snapFutureLater.projection[1].outflow, snapFutureNext.projection[1].outflow);
+eq("b) 익익월부터 예측에 포함",
+  snapFutureLater.projection[2].outflow, snapFutureNext.projection[2].outflow + 13_200);
+
+const snapFutureCard = cashflowSnapshot(MONTH, {
+  ...base,
+  scheduled: [...scheduled, futureNextFixed, futureCardFixed],
+  methods: [...methods, instantPay],
+  overrides: [], nextOverrides: [],
+});
+eq("c) 미래 시작 카드결제는 익월 현금 합계에서 제외",
+  snapFutureCard.nextOutTotal, snapFutureNext.nextOutTotal);
+eq("c) 미래 시작 카드결제는 익월 예측 합계에서도 제외",
+  snapFutureCard.nextForecastOut, snapFutureNext.nextForecastOut);
+eq("c) 미래 시작 카드결제는 익익월 예측에서도 제외",
+  snapFutureCard.projection[2].outflow, snapFutureNext.projection[2].outflow);
+
+const snapLegacyNoStart = cashflowSnapshot(MONTH, {
+  ...base,
+  scheduled: [...scheduled, legacyNoStartFixed],
+  methods: [...methods, instantPay],
+  overrides: [], nextOverrides: [],
+});
+const legacyNextItem = snapLegacyNoStart.nextItems.find((i) => i.key === "fixed:sp-legacy-no-start");
+eq("d) 시작일 없는 기존 항목은 여전히 no-recent", legacyNextItem?.reason, "no-recent");
+eq("d) 시작일 없는 기존 항목은 익월 예측에도 미포함", legacyNextItem?.inForecast, false);
+
+eq("e) 미래 시작 항목을 추가해도 당월 pendingOutAll 불변",
+  snapFutureLater.pendingOutAll, snapA.pendingOutAll);
+eq("e) 미래 시작 항목을 추가해도 당월 paidOutAll 불변",
+  snapFutureLater.paidOutAll, snapA.paidOutAll);
+eq("e) 미래 시작 항목을 추가해도 당월 currentForecastOut 불변",
+  snapFutureLater.currentForecastOut, snapA.currentForecastOut);
+
+// ── 18. 시작월이 당월이 된 신규 정기지출도 첫 출금 전까지 사라지지 않는다 (설계 215) ──
+// 미래 시작만 면제하면 시작월이 당월이 되는 순간 실적이 없어 no-recent 로 떨어져
+// 당월·익월·여러 달 예측에서 통째로 빠진다(지난달 화면의 이번 달 예측 ≠ 이번 달 화면의 숫자).
+console.log("\n[18] 시작월 당월 신규 정기지출은 첫 출금 전에도 당월·익월·예측에 남는다 (설계 215)");
+const startsThisMonth: HhScheduledPayment = {
+  ...futureNextFixed, id: "sp-starts-this", title: "당월시작고정비", amount: 6_400, start_date: "2026-07-22",
+};
+const snapStartsThis = cashflowSnapshot(MONTH, {
+  ...base,
+  scheduled: [...scheduled, startsThisMonth],
+  methods: [...methods, instantPay],
+  overrides: [], nextOverrides: [],
+});
+const startsThisCur = snapStartsThis.classified.find((i) => i.key === "fixed:sp-starts-this");
+const startsThisNext = snapStartsThis.nextItems.find((i) => i.key === "fixed:sp-starts-this");
+check("전제: 당월 classified 에 있다", startsThisCur != null);
+check("전제: 최근 실적은 없다", !snapStartsThis.paidRecently.has("fixed:sp-starts-this"));
+eq("f) 당월에 no-recent 없이 예정", startsThisCur?.reason, null);
+eq("f) 당월 출금예정(미지급)에 6,400원 포함", snapStartsThis.pendingOutAll, snapA.pendingOutAll + 6_400);
+eq("f) 당월 예측 첫 달에도 6,400원 포함", snapStartsThis.currentForecastOut, snapA.currentForecastOut + 6_400);
+eq("f) 익월에도 예정", startsThisNext?.reason, null);
+eq("f) 익월 예측에 포함", startsThisNext?.inForecast, true);
+eq("f) 익익월 예측에도 6,400원 포함", snapStartsThis.projection[2].outflow, snapA.projection[2].outflow + 6_400);
+
+// 시작월이 지났는데도 실적이 없으면 신규 면제는 끝나고 기존 규칙(no-recent)을 받는다.
+const startedLastMonth: HhScheduledPayment = { ...startsThisMonth, id: "sp-started-last", start_date: "2026-06-22" };
+const snapStartedLast = cashflowSnapshot(MONTH, {
+  ...base,
+  scheduled: [...scheduled, startedLastMonth],
+  methods: [...methods, instantPay],
+  overrides: [], nextOverrides: [],
+});
+eq("g) 시작월이 지나고 실적 없으면 당월 no-recent(회귀 방지)",
+  snapStartedLast.classified.find((i) => i.key === "fixed:sp-started-last")?.reason, "no-recent");
+eq("g) 당월 출금예정 불변", snapStartedLast.pendingOutAll, snapA.pendingOutAll);
+
+// 익월은 nextForecastOut 으로 통째로 대체되므로, 시작 전 달을 거르는지는 m+2 이후에서 본다.
+const startsM3: HhScheduledPayment = { ...futureNextFixed, id: "sp-starts-m3", title: "3개월뒤시작", amount: 4_700, start_date: "2026-10-22" };
+const snapM3Base = cashflowSnapshot(MONTH, { ...base, horizon: 4, methods: [...methods, instantPay], overrides: [], nextOverrides: [] });
+const snapM3 = cashflowSnapshot(MONTH, {
+  ...base, horizon: 4,
+  scheduled: [...scheduled, startsM3],
+  methods: [...methods, instantPay],
+  overrides: [], nextOverrides: [],
+});
+eq("h) 시작 전 달(m+2)에는 예측에 없다", snapM3.projection[2].outflow, snapM3Base.projection[2].outflow);
+eq("h) 시작월(m+3)부터 예측에 포함", snapM3.projection[3].outflow, snapM3Base.projection[3].outflow + 4_700);
+
 console.log(`\n${failures === 0 ? "✅ 전체 통과" : `❌ 실패 ${failures}건`}`);
 process.exit(failures === 0 ? 0 : 1);
