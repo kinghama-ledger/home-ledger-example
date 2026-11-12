@@ -1,35 +1,13 @@
-// 가계부 기본 마스터 시드값. 설정 화면의 "기본값 생성" 버튼에서 사용한다.
+// 가계부 기본값과 문자 분류 규칙.
+// 설정 화면의 "기본값 생성" 단추는 이 가운데 카테고리와 가맹점 분류만 쓴다(인물·계좌·카드는 만들지 않는다).
 // 카테고리는 흔한 가계부 양식의 항목 구성을 따른다.
 //
-// ★샘플 가족(템플릿용 가상 인물 — 실존 인물·계좌가 아니다):
+// ★아래 이체·수입 규칙의 이름은 샘플 가족 기준이다(가상 인물 — 실존 인물·계좌가 아니다):
 //   본인 김하늘 · 배우자 이바다 · 공용 '가족'. 계좌·카드 이름은 `은행(소유자)` 꼴을 따른다
-//   (계좌명이 소유자를 품는 것이 이 앱의 명명 규칙 — account-color.ts·card-group.ts 가 그 괄호를 읽는다).
+//   (계좌명이 소유자를 품는 것이 이 앱의 명명 규칙 — card-group.ts 가 그 괄호를 읽는다).
+//   가상 가족의 인물·계좌·카드 자체는 scripts/seed-demo.mjs 가 넣는다.
 
 import type { SmsKind } from "@/lib/household/sms";
-
-export const DEFAULT_PERSONS = ["김하늘", "이바다", "가족"];
-
-// 기본 계좌 3개. person 은 DEFAULT_PERSONS 의 이름(시드 시 person_id 로 치환).
-export const DEFAULT_ACCOUNTS: { name: string; bank: string; person: string; kind: "checking" | "stock" | "family" | "other" }[] = [
-  { name: "국민은행(김하늘)", bank: "국민은행", person: "김하늘", kind: "checking" },
-  { name: "카카오뱅크(김하늘)", bank: "카카오뱅크", person: "김하늘", kind: "checking" },
-  { name: "신한은행(이바다)", bank: "신한은행", person: "이바다", kind: "checking" },
-];
-
-// 기본 카드 3장. card_no 는 끝4자리만 실제 값이면 된다(문자 수집은 끝4로 카드를 찾는다 — 설계 26).
-// linkedAccount 는 DEFAULT_ACCOUNTS 의 이름(시드 시 linked_account_id 로 치환).
-export const DEFAULT_CARDS: {
-  name: string;
-  person: string;
-  kind: "credit" | "check";
-  cardNo: string;
-  linkedAccount: string;
-  billingDay: number;
-}[] = [
-  { name: "삼성카드(김하늘)", person: "김하늘", kind: "credit", cardNo: "****-****-****-1234", linkedAccount: "국민은행(김하늘)", billingDay: 25 },
-  { name: "현대카드(이바다)", person: "이바다", kind: "credit", cardNo: "****-****-****-5678", linkedAccount: "신한은행(이바다)", billingDay: 25 },
-  { name: "국민카드(김하늘)", person: "김하늘", kind: "credit", cardNo: "****-****-****-9012", linkedAccount: "국민은행(김하늘)", billingDay: 14 },
-];
 
 // 지출 카테고리 (기본 18종 중 '할부'(결제방식이라 hh_installment로 별도 관리) 제외한 17종 + 일상 분리용 5종 추가)
 // 추가: 다과/카페비(커피·디저트), 미용/뷰티, 교육비, 구독료, 여행

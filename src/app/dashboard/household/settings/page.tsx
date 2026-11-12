@@ -34,12 +34,9 @@ import { browserDb } from "@/lib/backend/browser";
 import { maskNamesIn } from "@/lib/privacy/mask";
 import { cn } from "@/lib/utils";
 import {
-  DEFAULT_ACCOUNTS,
-  DEFAULT_CARDS,
   DEFAULT_EXPENSE_CATEGORIES,
   DEFAULT_INCOME_CATEGORIES,
   DEFAULT_MERCHANT_MAP,
-  DEFAULT_PERSONS,
 } from "@/lib/household/defaults";
 import { usePrivacyMode } from "@/components/privacy/privacy-mode";
 import { getOwnerUid, maskAccountNo, maskCardNo } from "@/lib/household/owner";
@@ -371,6 +368,9 @@ export default function HouseholdSettingsPage() {
   };
 
   // ── 기본값 생성 ──
+  // 누구의 가계부에나 맞는 것만 만든다: 카테고리, '현금' 결제수단, 가맹점 → 카테고리 분류.
+  // 인물·계좌·카드는 만들지 않는다 — 예전에는 가상 가족(김하늘·이바다)의 인물·계좌·카드까지 만들어,
+  // 자기 자료를 넣은 뒤 이 단추를 누르면 남의 통장이 다시 생겼다. 가상 자료는 `npm run seed:demo` 만 넣는다.
   const seedDefaults = async () => {
     const owner = await getOwnerUid(supabase);
     if (!owner) {
@@ -378,15 +378,6 @@ export default function HouseholdSettingsPage() {
       return;
     }
     const tasks: PromiseLike<{ error: unknown }>[] = [];
-
-    const existingPersons = new Set(persons.map((p) => p.name));
-    const newPersons = DEFAULT_PERSONS.filter((n) => !existingPersons.has(n)).map((name, i) => ({
-      owner_auth_uid: owner,
-      name,
-      sort_order: i,
-      is_active: true,
-    }));
-    if (newPersons.length) tasks.push(supabase.from("hh_person").insert(newPersons));
 
     const existingCats = new Set(categories.map((c) => `${c.kind}:${c.name}`));
     const newCats = [
@@ -423,50 +414,6 @@ export default function HouseholdSettingsPage() {
       failed = results.some((r) => (r as { error?: unknown }).error);
     }
 
-    // 샘플 계좌·카드(defaults.ts DEFAULT_ACCOUNTS·DEFAULT_CARDS) — 인물 id 가 필요하므로 인물 생성 뒤에 조회한다.
-    // 이름이 같은 계좌·결제수단이 이미 있으면 건너뛴다(두 번 눌러도 중복 생성 없음).
-    const { data: personRows } = await supabase.from("hh_person").select("id,name").eq("owner_auth_uid", owner);
-    const personIdByName = new Map((personRows ?? []).map((p) => [p.name as string, p.id as string]));
-    const existingAccountNames = new Set(accounts.map((a) => a.name));
-    const newAccounts = DEFAULT_ACCOUNTS.filter((a) => !existingAccountNames.has(a.name)).map((a, i) => ({
-      owner_auth_uid: owner,
-      name: a.name,
-      bank: a.bank,
-      account_no: null,
-      person_id: personIdByName.get(a.person) ?? null,
-      kind: a.kind,
-      opening_balance: 0,
-      sort_order: i,
-      is_active: true,
-    }));
-    let seededAccounts = 0;
-    if (newAccounts.length) {
-      const { error: accErr } = await supabase.from("hh_account").insert(newAccounts);
-      if (accErr) failed = true;
-      else seededAccounts = newAccounts.length;
-    }
-    const { data: accountRows } = await supabase.from("hh_account").select("id,name").eq("owner_auth_uid", owner);
-    const accountIdByName = new Map((accountRows ?? []).map((a) => [a.name as string, a.id as string]));
-    const existingMethodNames = new Set(methods.map((m) => m.name));
-    const newCards = DEFAULT_CARDS.filter((c) => !existingMethodNames.has(c.name)).map((c, i) => ({
-      owner_auth_uid: owner,
-      name: c.name,
-      kind: c.kind,
-      person_id: personIdByName.get(c.person) ?? null,
-      linked_account_id: accountIdByName.get(c.linkedAccount) ?? null,
-      billing_day: c.billingDay,
-      card_no: c.cardNo,
-      card_expiry: null,
-      is_active: true,
-      sort_order: i + 1,
-    }));
-    let seededCards = 0;
-    if (newCards.length) {
-      const { error: cardErr } = await supabase.from("hh_payment_method").insert(newCards);
-      if (cardErr) failed = true;
-      else seededCards = newCards.length;
-    }
-
     // 가맹점 → 카테고리 기본 매핑 시드 (카테고리 id 가 필요하므로 마스터 생성 후 조회)
     const { data: expCats } = await supabase
       .from("hh_category")
@@ -490,14 +437,14 @@ export default function HouseholdSettingsPage() {
       else mapInserted = ins?.length ?? 0;
     }
 
-    if (!tasks.length && !mapInserted && !seededAccounts && !seededCards) {
+    if (!tasks.length && !mapInserted) {
       toast.info("이미 기본값이 모두 있습니다.");
       return;
     }
     if (failed) {
       toast.error("기본값 생성 중 일부 실패했습니다.");
     } else {
-      toast.success("기본 인물·계좌·카드·카테고리·가맹점 매핑을 생성했습니다.");
+      toast.success("기본 카테고리·현금 결제수단·가맹점 분류를 만들었습니다. 인물·계좌·카드는 직접 등록하세요.");
       reportEvent("CREATE_HOUSEHOLD_DEFAULTS", "가계부 기본 마스터 생성", { resource: "household" });
     }
     await fetchData();
@@ -692,7 +639,7 @@ export default function HouseholdSettingsPage() {
             </Button>
           </div>
           {!hasAnyEntry ? (
-            <EmptyHint text="등록된 계좌·카드가 없습니다. '계좌·카드 등록' 또는 '기본값 생성'으로 시작하세요." />
+            <EmptyHint text="등록된 계좌·카드가 없습니다. '계좌·카드 등록'으로 시작하세요." />
           ) : (
             <SimpleTable
               head={[

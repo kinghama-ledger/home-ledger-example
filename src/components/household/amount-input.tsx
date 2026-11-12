@@ -4,6 +4,7 @@ import * as React from "react";
 
 import { usePrivacyMode } from "@/components/privacy/privacy-mode";
 import { Input } from "@/components/ui/input";
+import { parseSignedAmountText } from "@/lib/household/signed-amount";
 
 /**
  * 원 단위 금액 입력 — 콤마 실시간 표시. (설계 docs/household/60 R1)
@@ -14,6 +15,9 @@ import { Input } from "@/components/ui/input";
  * allowFormula(설계 72): 엑셀처럼 `=3+5+70` 같은 사칙연산 식을 입력하면 합계로 계산.
  * 이자 수입처럼 작은 금액이 여러 번 들어올 때 합산 입력용. 수식 입력 중엔 아래에
  * 계산 결과를 미리 보여주고, 값은 실시간으로 반영된다(빈 식·오류 시 직전 값 유지).
+ *
+ * allowNegative: 맨 앞 빼기표를 받는다 — 통장 시작 잔액(마이너스 통장) 전용. 수식 입력과 함께 쓰지 않는다.
+ * 아이폰 숫자 자판에는 빼기표가 없어 이때만 일반 자판을 띄운다.
  */
 
 // 수식 판정: 사칙연산자(+ - * /)가 있거나 '='로 시작하면 수식으로 본다.
@@ -43,6 +47,7 @@ export function AmountInput({
   value,
   onValueChange,
   allowFormula = false,
+  allowNegative = false,
   className,
   ...props
 }: Omit<React.ComponentProps<typeof Input>, "type" | "value" | "onChange"> & {
@@ -50,8 +55,10 @@ export function AmountInput({
   onValueChange: (n: number) => void;
   /** 엑셀식 수식(=3+5+70) 합계 입력 허용 (설계 72). 기본 false. */
   allowFormula?: boolean;
+  /** 음수 입력 허용(맨 앞 빼기표). 기본 false. */
+  allowNegative?: boolean;
 }) {
-  // 수식 편집 중 원문 버퍼. null 이면 콤마 표시(숫자 모드).
+  // 수식 편집 중 원문 버퍼. null 이면 콤마 표시(숫자 모드). 음수 허용 칸에서는 숫자 없이 친 빼기표를 잠깐 담는다.
   const [draft, setDraft] = React.useState<string | null>(null);
   const { enabled: masked, mask } = usePrivacyMode();
 
@@ -66,6 +73,25 @@ export function AmountInput({
         readOnly
         aria-readonly="true"
         title="마스킹 모드에서는 금액을 고칠 수 없습니다"
+      />
+    );
+  }
+
+  if (allowNegative && !allowFormula) {
+    return (
+      <Input
+        type="text"
+        inputMode="text"
+        autoComplete="off"
+        className={className}
+        value={draft ?? (value === 0 ? "" : value.toLocaleString("ko-KR"))}
+        onChange={(e) => {
+          const parsed = parseSignedAmountText(e.target.value);
+          setDraft(parsed.pendingMinus ? "-" : null);
+          onValueChange(parsed.value);
+        }}
+        onBlur={() => setDraft(null)}
+        {...props}
       />
     );
   }

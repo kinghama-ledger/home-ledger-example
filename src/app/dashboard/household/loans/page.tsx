@@ -57,7 +57,9 @@ export default function HouseholdLoansPage() {
 
   const [loans, setLoans] = useState<HhLoan[]>([]);
   // 등록된 사람 이름 — 대출명 안의 이름을 가릴 때만 쓴다(괄호 없이 적은 "주택담보대출-홍길동" 같은 이름).
-  const [personNames, setPersonNames] = useState<string[]>([]);
+  // 등록된 순서대로(sort_order, 이름) — 가림 모드의 이름 가리기와 출금계좌 칸 색(첫째 파랑·둘째 주황)이 쓴다.
+  const [persons, setPersons] = useState<{ id: string; name: string }[]>([]);
+  const personNames = useMemo(() => persons.map((p) => p.name), [persons]);
   const [accounts, setAccounts] = useState<HhAccount[]>([]);
   const [payments, setPayments] = useState<HhTransaction[]>([]);
   const [month, setMonth] = useState(thisMonthKey);
@@ -82,7 +84,7 @@ export default function HouseholdLoansPage() {
       supabase.from("hh_transaction").select("*").eq("type", "payment")
         .gte("txn_date", prevStart).lte("txn_date", end).order("txn_date", { ascending: true }),
       supabase.from("hh_account").select("*").order("sort_order", { ascending: true }),
-      supabase.from("hh_person").select("name"),
+      supabase.from("hh_person").select("id, name").order("sort_order").order("name"),
     ]);
     // payRes 가 실패하면 상환 거래가 빈 배열이 되어 '당월 실제 상환'이 0원으로 보인다.
     // acctRes 실패는 출금계좌가 전부 '-'. 셋 다 가드에 넣는다.
@@ -97,7 +99,7 @@ export default function HouseholdLoansPage() {
       return;
     }
     setLoans((loanRes.data ?? []) as HhLoan[]);
-    setPersonNames(((personRes.data ?? []) as { name: string }[]).map((p) => p.name));
+    setPersons((personRes.data ?? []) as { id: string; name: string }[]);
     // ★상한에 닿으면 조용히 잘린다(설계 162 ⑦: 1,000행을 넘으면
     //   최근 거래가 통째로 빠지는데 오류가 나지 않는다). 두 달치 납부거래라 여유가 크지만, 침묵보다 낫다.
     const payRows = (payRes.data ?? []) as HhTransaction[];
@@ -187,9 +189,9 @@ export default function HouseholdLoansPage() {
     for (const a of accounts) m.set(a.id, a.name);
     return m;
   }, [accounts]);
-  // 출금계좌 칸 색 — 현금흐름과 같은 소유자 색(김하늘=연파랑·이바다=연주황, 설계 127).
-  // 이 화면은 인물(hh_person)을 안 불러오므로 accountTintMap 이 계좌명으로 소유자를 판별한다.
-  const accountTint = useMemo(() => accountTintMap(accounts), [accounts]);
+  // 출금계좌 칸 색 — 현금흐름과 같은 소유자 색(등록된 첫째 인물=연파랑·둘째 인물=연주황, 설계 127).
+  // 인물 조회가 실패하면(가림이 꺼져 있을 때는 화면을 멈추지 않는다) 모든 칸이 '그 밖' 색으로 나온다.
+  const accountTint = useMemo(() => accountTintMap(accounts, persons), [accounts, persons]);
 
   const active = activeLoans; // 위에서 이미 걸렀다 — 같은 기준을 FigureCard·표가 공유한다.
   const closed = loans.filter((l) => l.status === "closed");

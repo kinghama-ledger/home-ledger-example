@@ -3,6 +3,8 @@ import { toast } from "sonner";
 
 import { useEffect, useState } from "react";
 
+import { AmountInput } from "@/components/household/amount-input";
+import { usePrivacyMode } from "@/components/privacy/privacy-mode";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -26,6 +28,7 @@ import type {
   HhPerson,
   HhPersonInsert,
 } from "@/lib/household/types";
+import { openingBalanceChangeNote, openingBalanceError } from "@/lib/household/signed-amount";
 
 const selectClass =
   "flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-base md:text-sm shadow-xs focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50";
@@ -193,6 +196,7 @@ export function AccountPaymentDialog({
 }) {
   const [mode, setMode] = useState<"account" | "card">("account");
   // 은행계좌 모드
+  const { enabled: privacyOn } = usePrivacyMode();
   const [acc, setAcc] = useState<AccountForm>(EMPTY_ACCOUNT);
   const [asPayment, setAsPayment] = useState(false);
   const [payKind, setPayKind] = useState<HhPaymentMethodKind>("check");
@@ -259,6 +263,11 @@ export function AccountPaymentDialog({
         toast.error("계좌명을 입력해주세요.");
         return;
       }
+      const balanceError = openingBalanceError(acc.opening_balance);
+      if (balanceError) {
+        toast.error(balanceError);
+        return;
+      }
       setSaving(true);
       try {
         await onSave({
@@ -296,6 +305,11 @@ export function AccountPaymentDialog({
       }
     }
   };
+
+  // 수정 창에서 시작 잔액을 바꾸는 중이면 현재 잔액이 얼마나 움직이는지 알려 준다.
+  // 가림 중에는 보이지 않게 한다 — 이 문장의 금액은 실제 차액이라 가짜 값으로 바꿔도 뜻이 없다.
+  const openingChangeNote =
+    !privacyOn && target?.type === "account" ? openingBalanceChangeNote(target.account.opening_balance, acc.opening_balance) : null;
 
   const title = !editing
     ? "계좌·카드 등록"
@@ -400,6 +414,34 @@ export function AccountPaymentDialog({
                   />
                   활성
                 </label>
+              </div>
+              {/* 시작 잔액 — 현재 잔액 = 시작 잔액 + 그 뒤 거래. 0 으로 두면 잔액이 은행 앱과 맞지 않는다.
+                  잔액이 있는 것(통장·지역화폐·페이 지갑)은 모두 은행계좌로 등록하므로 이 칸은 은행계좌에만 있다. */}
+              <div className="space-y-2">
+                <Label htmlFor="acc-opening">시작 잔액</Label>
+                <div className="grid grid-cols-2 gap-4">
+                  <AmountInput
+                    id="acc-opening"
+                    allowNegative
+                    className="text-right tabular-nums"
+                    value={acc.opening_balance}
+                    onValueChange={(n) => setAcc({ ...acc, opening_balance: n })}
+                    placeholder="0"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  이 통장의 첫 거래를 가계부에 적기 직전 잔액입니다. 오늘부터 적기 시작한다면 통장 앱의 지금 잔액을 넣으세요.
+                  이미 거래를 적었거나 지난 거래도 넣을 거라면, 지금 잔액이 아니라 그 첫 거래 직전 잔액을 넣어야 맞습니다.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  마이너스 통장처럼 잔액이 0보다 적으면 숫자 앞에 -를 붙입니다.
+                </p>
+                {editing ? (
+                  <p className="text-xs text-muted-foreground">
+                    시작 잔액을 바꾸면 현재 잔액도 그만큼 바뀝니다.
+                    {openingChangeNote ? <span className="font-medium text-foreground"> {openingChangeNote}</span> : null}
+                  </p>
+                ) : null}
               </div>
 
               {/* 결제수단으로도 등록 */}

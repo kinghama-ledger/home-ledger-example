@@ -3,14 +3,16 @@
  *
  * ★설계 126(계좌마다 다른 색, 20색 팔레트)은 폐기됐다. 계좌 단위 색은 계좌를 추가·삭제하면
  *   전체 색이 밀리고, 20색을 훑어도 "이게 누구 통장인가"라는 실제 질문에는 답을 못 했다.
- *   필요한 구분은 **사람**이다: 김하늘 통장인가, 이바다 통장인가, 아니면 카드인가.
+ *   필요한 구분은 **사람**이다: 내 통장인가, 배우자 통장인가, 아니면 카드인가.
  *
  * 배정 규칙
- *   - **김하늘 계좌 = 연한 파랑, 이바다 계좌 = 연한 주황.** 소유자가 같으면 은행이 달라도 같은 색이다.
- *   - 그 밖의 소유자(공용·미상)는 연한 초록 — 두 사람 색과 겹치지 않게만 한다.
+ *   - **등록된 인물 순서대로: 첫째 인물 계좌 = 연한 파랑, 둘째 인물 계좌 = 연한 주황.** 소유자가 같으면 은행이 달라도 같은 색이다.
+ *     순서는 설정 → 인물의 '표시 순서'(같으면 이름순)다. 가상 가족이면 김하늘이 파랑, 이바다가 주황이다.
+ *     예전에는 두 이름이 코드에 박혀 있어, 자기 가족을 등록하면 모든 통장이 초록 한 색이었다.
+ *   - 그 밖의 소유자(셋째부터·공용·미상)는 연한 초록 — 두 사람 색과 겹치지 않게만 한다.
  *   - **카드 행은 CARD_TINT(회색)** — 계좌 색과 항상 구분된다. "통장에서 그날 빠지는 돈"과
  *     "카드대금일에 몰아 나가는 돈"이 색만으로 갈리는 것이 목적이다.
- *   - 소유자 판별: ① 계좌의 person_id → 인물명 (persons 를 넘긴 화면) ② 없으면 계좌명에서 찾는다
+ *   - 소유자 판별: ① 계좌의 person_id(명의) ② 명의가 비어 있으면 계좌명에 든 인물 이름
  *     — 계좌명이 '국민은행(김하늘)'처럼 소유자를 품는 것이 이 앱의 명명 규칙이라 폴백이 안전하다.
  *   - 배경은 -50 이 아니라 **-100** 이다: -50 은 흰 배경 위에서 색이 거의 안 읽혔다(실측, 설계 126).
  *
@@ -20,13 +22,13 @@
  *   쪽이 이겨 의도한 색이 조용히 죽는다.
  */
 
-/** 소유자 → 색. 키는 hh_person 의 실제 이름과 계좌명 괄호 표기가 공유하는 문자열이다. */
-const OWNER_TINTS: Record<string, string> = {
-  김하늘: "border-blue-400 bg-blue-100 text-blue-900 dark:border-blue-700 dark:bg-blue-950/60 dark:text-blue-200",
-  이바다: "border-orange-400 bg-orange-100 text-orange-900 dark:border-orange-700 dark:bg-orange-950/60 dark:text-orange-200",
-};
+/** 등록된 인물 순서 → 색. 첫째 인물이 파랑, 둘째 인물이 주황이다. */
+const OWNER_TINTS_IN_ORDER: string[] = [
+  "border-blue-400 bg-blue-100 text-blue-900 dark:border-blue-700 dark:bg-blue-950/60 dark:text-blue-200",
+  "border-orange-400 bg-orange-100 text-orange-900 dark:border-orange-700 dark:bg-orange-950/60 dark:text-orange-200",
+];
 
-/** 그 밖의 소유자(공용·미상) — 두 사람 색과 계열이 겹치지 않는 연한 초록. */
+/** 그 밖의 소유자(셋째부터·공용·미상) — 두 사람 색과 계열이 겹치지 않는 연한 초록. */
 const OWNER_TINT_ETC =
   "border-emerald-400 bg-emerald-100 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-200";
 
@@ -45,21 +47,25 @@ export const ACCOUNT_TINT_NONE = "border-border/60 bg-background";
 
 /**
  * 계좌 id → 소유자 색 클래스 묶음(border/bg/text).
- * persons 를 넘기면 person_id 로 판별하고, 없으면(대출관리처럼 인물을 안 불러오는 화면) 계좌명으로 판별한다.
- * 호출부는 `useMemo` 로 감싸 계좌 목록이 바뀔 때만 다시 만든다.
+ * persons 는 **등록된 순서대로**(sort_order, 이름) 넘긴다 — 그 순서가 색을 정한다.
+ * 호출부는 `useMemo` 로 감싸 계좌·인물 목록이 바뀔 때만 다시 만든다.
  */
 export function accountTintMap(
   accounts: { id: string; name: string; person_id?: string | null }[],
-  persons?: { id: string; name: string }[],
+  persons: { id: string; name: string }[],
 ): Map<string, string> {
-  const personName = new Map((persons ?? []).map((p) => [p.id, p.name]));
-  const owners = Object.keys(OWNER_TINTS);
+  const orderById = new Map(persons.map((p, i) => [p.id, i]));
   const m = new Map<string, string>();
   for (const a of accounts) {
-    // 인물이 지정돼 있으면 그것이 답이다 — 제3의 인물 계좌를 이름 문자열로 두 사람 색에 오배정하지 않는다.
-    const byPerson = a.person_id ? personName.get(a.person_id) : undefined;
-    const owner = byPerson ?? owners.find((o) => a.name.includes(o));
-    m.set(a.id, owner ? OWNER_TINTS[owner] ?? OWNER_TINT_ETC : OWNER_TINT_ETC);
+    let order: number | undefined;
+    if (a.person_id) {
+      // 명의가 지정돼 있으면 그것이 답이다 — 제3의 인물 계좌를 이름 문자열로 두 사람 색에 오배정하지 않는다.
+      order = orderById.get(a.person_id);
+    } else {
+      const byName = persons.findIndex((p) => p.name !== "" && a.name.includes(p.name));
+      order = byName < 0 ? undefined : byName;
+    }
+    m.set(a.id, (order === undefined ? undefined : OWNER_TINTS_IN_ORDER[order]) ?? OWNER_TINT_ETC);
   }
   return m;
 }

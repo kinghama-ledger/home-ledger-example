@@ -811,7 +811,7 @@ export default function HouseholdCashPage() {
     return accId ? accounts.find((a) => a.id === accId)?.name ?? null : null;
   };
 
-  // '출금계좌 / 결제계좌' 칸 색 — **소유자 단위**(김하늘=연파랑·이바다=연주황, 설계 127, 요구 사항 2026-08-03).
+  // '출금계좌 / 결제계좌' 칸 색 — **소유자 단위**(설정 → 인물 목록의 첫째=연파랑·둘째=연주황·그 밖=연초록, account-color.ts).
   // 색은 계좌의 person_id/이름으로 정해지므로 마스킹으로 이름이 가려져도 구분이 남는다.
   const accountTint = useMemo(() => accountTintMap(accounts, persons), [accounts, persons]);
   // 계좌가 안 정해진 칸은 무채색 — 색이 붙었다는 건 '어느 통장인지 정해졌다'는 뜻이어야 한다.
